@@ -1,0 +1,41 @@
+{
+  "name": "@onchaindiligence/sdk",
+  "version": "0.1.0",
+  "description": "Typed client for the OnchainDiligence compliance API — pay-per-call sanctions, OFAC name, and UK company checks, with the 402 payment flow handled for you.",
+  "type": "module",
+  "main": "./dist/index.js",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "prepublishOnly": "npm run build"
+  },
+  "keywords": [
+    "compliance",
+    "sanctions",
+    "ofac",
+    "x402",
+    "402",
+    "mppx",
+    "tempo",
+    "agent",
+    "web3"
+  ],
+  "license": "MIT",
+  "peerDependencies": {
+    "mppx": "^0.7.0",
+    "viem": "^2.53.1"
+  },
+  "devDependencies": {
+    "typescript": "^5.9.3"
+  }
+}
