@@ -33,7 +33,7 @@
   "license": "MIT",
   "peerDependencies": {
     "mppx": "^0.7.0",
-    "viem": "^2.53.1"
+    "viem": "^2.56.0"
   },
   "devDependencies": {
     "typescript": "^5.9.3"
