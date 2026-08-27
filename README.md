@@ -67,11 +67,11 @@ Errors throw `OnchainDiligenceError` with the HTTP `status` and a message.
 
 ## Verifying an attestation
 
-The `signature` is an Ed25519 signature over the response data plus issue metadata. Off-chain verification is straightforward with the public key at `/.well-known/attestation-key`:
+The SDK resolves the attestation's exact `key_id` through the public key registry and verifies locally. Version 2 uses domain-separated RFC 8785 canonical JSON; legacy attestations retain their original verification path. Retired keys continue to verify, while revoked or compromised keys return `valid: false` even when their signature bytes match:
 
 ```ts
-import { verify } from '@noble/ed25519'
-// fetch the public key, reconstruct the signed bytes, then verify(signature, message, pubKey)
+const result = await od.verifyAttestation(signed)
+// { valid, cryptographicallyValid, trusted, keyId, keyStatus, schemaVersion }
 ```
 
 **On-chain verification — read this first.** The EVM has no native Ed25519 precompile (only `ecrecover` for ECDSA), so verifying an Ed25519 signature *inside* a Solidity contract is expensive and non-trivial — it requires a full Ed25519 implementation in the contract. For most use cases, verify off-chain. If you need on-chain proof that a check happened, prefer the **anchoring** flow (`anchor()` / `anchored()`), which records the attestation hash on Tempo so a contract can check a `bytes32` rather than recover an Ed25519 signature. That's the cheaper, EVM-friendly path to on-chain verifiability.

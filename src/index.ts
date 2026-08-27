@@ -30,15 +30,34 @@ export interface OnchainDiligenceOptions {
   account: Account
   /** Base URL of the API. Defaults to production. */
   baseUrl?: string
+  /** Expected issuer for versioned attestations. Defaults to the production issuer. */
+  expectedAttestationIssuer?: string
 }
 
 /** The signed-attestation envelope every paid response carries. */
 export interface Attestation {
   signed: boolean
+  schema_version?: string
+  issuer?: string
+  purpose?: string
   key_id?: string
   algorithm?: string
+  canonicalization?: string
   signature?: string
   issued_at?: string
+}
+
+export type AttestationKeyStatus = 'active' | 'retired' | 'revoked' | 'compromised'
+
+export interface AttestationKeyRecord {
+  key_id: string
+  algorithm: 'ed25519'
+  public_key_pem: string
+  status: AttestationKeyStatus
+  valid_from: string | null
+  valid_until: string | null
+  status_changed_at: string | null
+  status_reason?: string
 }
 
 export interface Signed<T> {
@@ -49,6 +68,12 @@ export interface Signed<T> {
 /** Result of locally verifying a signed attestation. */
 export interface VerifyResult {
   valid: boolean
+  /** Whether the Ed25519 signature itself matched, even if the key is distrusted. */
+  cryptographicallyValid?: boolean
+  /** Whether policy permits trusting this key status. */
+  trusted?: boolean
+  keyStatus?: AttestationKeyStatus
+  schemaVersion?: string
   /** The key_id the signature was checked against, when available. */
   keyId?: string
   /** Human-readable reason when `valid` is false. */
@@ -190,14 +215,20 @@ export class OnchainDiligenceError extends Error {
 }
 
 const DEFAULT_BASE_URL = 'https://api.onchaindiligence.com'
+const DEFAULT_ATTESTATION_ISSUER = 'https://api.onchaindiligence.com'
+const V2_SCHEMA = 'onchaindiligence.attestation.v2'
+const V2_PURPOSE = 'compliance-screening-result'
+const V2_FIXTURE_PURPOSE = 'verification-fixture'
 
 export class OnchainDiligence {
   private readonly baseUrl: string
+  private readonly expectedAttestationIssuer: string
   private readonly fetch: typeof globalThis.fetch
-  private attestationKeyPem: string | null = null
+  private readonly attestationKeys = new Map<string, AttestationKeyRecord>()
 
   constructor(opts: OnchainDiligenceOptions) {
     this.baseUrl = (opts.baseUrl ?? DEFAULT_BASE_URL).replace(/\/$/, '')
+    this.expectedAttestationIssuer = opts.expectedAttestationIssuer ?? DEFAULT_ATTESTATION_ISSUER
     // Payment-aware fetch: transparently answers 402 challenges and retries.
     const client = Mppx.create({ methods: [tempo({ account: opts.account })] })
     this.fetch = client.fetch
@@ -346,11 +377,10 @@ export class OnchainDiligence {
 
   /**
    * Verify a signed attestation locally. Fetches the server's published
-   * Ed25519 public key once (cached), then checks the signature over the
-   * canonical signing input `JSON.stringify({ data, issued_at, key_id })` —
-   * the exact bytes the server signs. A `valid: true` result means the data
-   * has not been altered since the server signed it, provable without trusting
-   * this SDK.
+   * exact Ed25519 key identified by `key_id` (cached), then verifies either
+   * the domain-separated RFC 8785 version 2 input or the legacy version 1
+   * JSON.stringify input. Revoked/compromised keys remain cryptographically
+   * checkable but return `valid: false` and `trusted: false`.
    *
    * Uses WebCrypto (`globalThis.crypto.subtle`) so it runs dependency-free in
    * Node 18+, edge runtimes, and modern browsers.
@@ -368,56 +398,150 @@ export class OnchainDiligence {
     if (!subtle) return { valid: false, reason: 'WebCrypto (crypto.subtle) is unavailable in this runtime' }
 
     let key: CryptoKey
+    let keyRecord: AttestationKeyRecord
     try {
-      const pem = await this.getAttestationKeyPem()
-      key = await subtle.importKey('spki', pemToDer(pem), { name: 'Ed25519' }, false, ['verify'])
+      keyRecord = await this.getAttestationKey(att.key_id)
+      key = await subtle.importKey(
+        'spki',
+        pemToDer(keyRecord.public_key_pem),
+        { name: 'Ed25519' },
+        false,
+        ['verify']
+      )
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err)
       return { valid: false, reason: `could not load public key: ${msg}`, keyId: att.key_id }
     }
 
-    const signingInput = JSON.stringify({
-      data: signed.data,
-      issued_at: att.issued_at,
-      key_id: att.key_id,
-    })
+    let signingInput: string
+    if (att.schema_version === V2_SCHEMA) {
+      if (att.issuer !== this.expectedAttestationIssuer) {
+        return {
+          valid: false,
+          trusted: false,
+          reason: `unexpected attestation issuer: ${att.issuer ?? 'missing'}`,
+          keyId: att.key_id,
+          keyStatus: keyRecord.status,
+          schemaVersion: att.schema_version,
+        }
+      }
+      if (
+        (att.purpose !== V2_PURPOSE && att.purpose !== V2_FIXTURE_PURPOSE) ||
+        att.canonicalization !== 'RFC8785'
+      ) {
+        return {
+          valid: false,
+          trusted: false,
+          reason: 'version 2 attestation has an unexpected purpose or canonicalization',
+          keyId: att.key_id,
+          keyStatus: keyRecord.status,
+          schemaVersion: att.schema_version,
+        }
+      }
+      signingInput = canonicalizeJson({
+        schema_version: att.schema_version,
+        issuer: att.issuer,
+        purpose: att.purpose,
+        data: signed.data,
+        issued_at: att.issued_at,
+        key_id: att.key_id,
+      })
+    } else if (!att.schema_version) {
+      signingInput = JSON.stringify({
+        data: signed.data,
+        issued_at: att.issued_at,
+        key_id: att.key_id,
+      })
+    } else {
+      return {
+        valid: false,
+        trusted: false,
+        reason: `unsupported attestation schema: ${att.schema_version}`,
+        keyId: att.key_id,
+        keyStatus: keyRecord.status,
+        schemaVersion: att.schema_version,
+      }
+    }
     const ok = await subtle.verify(
       'Ed25519',
       key,
       b64urlToBytes(att.signature),
       new TextEncoder().encode(signingInput)
     )
-    return ok
-      ? { valid: true, keyId: att.key_id }
-      : { valid: false, reason: 'signature does not match', keyId: att.key_id }
+    if (!ok) {
+      return {
+        valid: false,
+        cryptographicallyValid: false,
+        trusted: false,
+        reason: 'signature does not match',
+        keyId: att.key_id,
+        keyStatus: keyRecord.status,
+        schemaVersion: att.schema_version ?? 'legacy-v1',
+      }
+    }
+
+    const trusted = keyRecord.status === 'active' || keyRecord.status === 'retired'
+    return {
+      valid: trusted,
+      cryptographicallyValid: true,
+      trusted,
+      ...(trusted ? {} : { reason: `attestation key is ${keyRecord.status}` }),
+      keyId: att.key_id,
+      keyStatus: keyRecord.status,
+      schemaVersion: att.schema_version ?? 'legacy-v1',
+    }
   }
 
   /**
-   * Fetch and cache the server's Ed25519 public key (PEM) from
-   * `/.well-known/attestation-key`. Accepts a raw PEM body or a JSON wrapper
-   * exposing the PEM under a common field name.
+   * Resolve and cache the exact public key named in an attestation. The legacy
+   * current-key endpoint is accepted only when its reported key_id matches.
    */
-  private async getAttestationKeyPem(): Promise<string> {
-    if (this.attestationKeyPem) return this.attestationKeyPem
-    const res = await this.fetch(`${this.baseUrl}/.well-known/attestation-key`)
-    if (!res.ok) {
-      throw new OnchainDiligenceError(res.status, 'could not fetch attestation public key')
+  private async getAttestationKey(keyId: string): Promise<AttestationKeyRecord> {
+    const cached = this.attestationKeys.get(keyId)
+    if (cached) return cached
+
+    const exact = await this.fetch(
+      `${this.baseUrl}/.well-known/attestation-keys/${encodeURIComponent(keyId)}`
+    )
+    if (exact.ok) {
+      const payload = (await exact.json()) as { key?: AttestationKeyRecord }
+      const record = payload.key
+      if (!record || record.key_id !== keyId || !record.public_key_pem?.includes('BEGIN PUBLIC KEY')) {
+        throw new Error('attestation key registry returned an invalid or mismatched key')
+      }
+      this.attestationKeys.set(keyId, record)
+      return record
     }
-    const text = await res.text()
+    if (exact.status !== 404) {
+      throw new OnchainDiligenceError(exact.status, 'could not fetch attestation public key')
+    }
+
+    const legacy = await this.fetch(`${this.baseUrl}/.well-known/attestation-key`)
+    if (!legacy.ok) {
+      throw new OnchainDiligenceError(legacy.status, 'could not fetch attestation public key')
+    }
+    const text = await legacy.text()
+    let reportedKeyId = ''
     let pem = text.trim()
     if (!pem.includes('BEGIN PUBLIC KEY')) {
-      try {
-        const j = JSON.parse(text) as Record<string, string>
-        pem = (j.public_key_pem || j.publicKey || j.pem || j.key || '').trim()
-      } catch {
-        /* not JSON — fall through to the check below */
-      }
+      const payload = JSON.parse(text) as Record<string, string>
+      reportedKeyId = payload.key_id || ''
+      pem = (payload.public_key_pem || payload.publicKey || payload.pem || payload.key || '').trim()
     }
-    if (!pem.includes('BEGIN PUBLIC KEY')) {
-      throw new Error('attestation-key endpoint did not return a PEM public key')
+    if (reportedKeyId !== keyId || !pem.includes('BEGIN PUBLIC KEY')) {
+      throw new Error('legacy attestation-key endpoint did not return the requested key_id')
     }
-    this.attestationKeyPem = pem
-    return pem
+    const record: AttestationKeyRecord = {
+      key_id: keyId,
+      algorithm: 'ed25519',
+      public_key_pem: pem,
+      status: 'active',
+      valid_from: null,
+      valid_until: null,
+      status_changed_at: null,
+    }
+    this.attestationKeys.set(keyId, record)
+    return record
   }
 }
 
@@ -439,4 +563,24 @@ function b64urlToBytes(s: string) {
   const out = new Uint8Array(bin.length)
   for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i)
   return out
+}
+
+/** RFC 8785 canonicalization for values already in the JSON data model. */
+function canonicalizeJson(value: unknown): string {
+  if (value === null || typeof value === 'boolean' || typeof value === 'string') {
+    return JSON.stringify(value)
+  }
+  if (typeof value === 'number') {
+    if (!Number.isFinite(value)) throw new TypeError('non-finite number in attestation')
+    return JSON.stringify(value)
+  }
+  if (Array.isArray(value)) return `[${value.map(canonicalizeJson).join(',')}]`
+  if (typeof value === 'object') {
+    const record = value as Record<string, unknown>
+    return `{${Object.keys(record)
+      .sort()
+      .map((key) => `${JSON.stringify(key)}:${canonicalizeJson(record[key])}`)
+      .join(',')}}`
+  }
+  throw new TypeError(`value of type ${typeof value} is not valid JSON`)
 }
