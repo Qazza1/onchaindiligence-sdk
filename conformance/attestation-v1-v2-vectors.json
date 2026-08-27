@@ -1,0 +1,98 @@
+{
+  "corpus_version": 1,
+  "description": "Test-only OnChainDiligence v1/v2 trust-foundation fixtures. No production key material.",
+  "verifier_options": { "now": "2026-08-27T12:01:00.000Z" },
+  "trust_records": {
+    "active": {
+      "key_id": "ed25519-BuP9j9opu2CrWVV9",
+      "algorithm": "ed25519",
+      "public_key_pem": "-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEA11qYAYKxCrfVS/7TyWQHOg7hcvPapiMlrwIaaPcHURo=\n-----END PUBLIC KEY-----\n",
+      "status": "active",
+      "valid_from": "2026-08-27T00:00:00.000Z",
+      "valid_until": null,
+      "status_changed_at": "2026-08-27T00:00:00.000Z"
+    },
+    "retired": {
+      "key_id": "ed25519-BuP9j9opu2CrWVV9",
+      "algorithm": "ed25519",
+      "public_key_pem": "-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEA11qYAYKxCrfVS/7TyWQHOg7hcvPapiMlrwIaaPcHURo=\n-----END PUBLIC KEY-----\n",
+      "status": "retired",
+      "valid_from": "2026-08-27T00:00:00.000Z",
+      "valid_until": "2026-08-27T12:30:00.000Z",
+      "status_changed_at": "2026-08-27T12:30:00.000Z"
+    },
+    "compromised": {
+      "key_id": "ed25519-BuP9j9opu2CrWVV9",
+      "algorithm": "ed25519",
+      "public_key_pem": "-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEA11qYAYKxCrfVS/7TyWQHOg7hcvPapiMlrwIaaPcHURo=\n-----END PUBLIC KEY-----\n",
+      "status": "compromised",
+      "valid_from": "2026-08-27T00:00:00.000Z",
+      "valid_until": null,
+      "status_changed_at": "2026-08-27T12:30:00.000Z",
+      "compromised_at": "2026-08-27T12:30:00.000Z"
+    }
+  },
+  "envelopes": {
+    "valid_v2": {
+      "data": { "address": "0x0000000000000000000000000000000000000001", "nested": { "empty": [], "unicode": "€ 😀" }, "sanctioned": false },
+      "attestation": {
+        "signed": true,
+        "schema_version": "onchaindiligence.attestation.v2",
+        "issuer": "https://api.onchaindiligence.com",
+        "purpose": "compliance-screening-result",
+        "issued_at": "2026-08-27T12:00:00.000Z",
+        "key_id": "ed25519-BuP9j9opu2CrWVV9",
+        "algorithm": "ed25519",
+        "canonicalization": "RFC8785",
+        "signature": "Q6znt7824vydlzqVP702c_U8krT3eqc30mmBtp2QYmfDC2vVj5LabHdRjeGbfE65aJGny3B_M6SzhcmSasADDQ"
+      }
+    },
+    "tampered_payload": {
+      "data": { "address": "0x0000000000000000000000000000000000000001", "nested": { "empty": [], "unicode": "€ 😀" }, "sanctioned": true },
+      "attestation": {
+        "signed": true,
+        "schema_version": "onchaindiligence.attestation.v2",
+        "issuer": "https://api.onchaindiligence.com",
+        "purpose": "compliance-screening-result",
+        "issued_at": "2026-08-27T12:00:00.000Z",
+        "key_id": "ed25519-BuP9j9opu2CrWVV9",
+        "algorithm": "ed25519",
+        "canonicalization": "RFC8785",
+        "signature": "Q6znt7824vydlzqVP702c_U8krT3eqc30mmBtp2QYmfDC2vVj5LabHdRjeGbfE65aJGny3B_M6SzhcmSasADDQ"
+      }
+    },
+    "valid_v1": {
+      "data": { "address": "0x0000000000000000000000000000000000000001", "nested": { "empty": [], "unicode": "€ 😀" }, "sanctioned": false },
+      "attestation": {
+        "signed": true,
+        "issued_at": "2026-08-27T12:00:00.000Z",
+        "key_id": "ed25519-BuP9j9opu2CrWVV9",
+        "algorithm": "ed25519",
+        "signature": "XOqtW1NgrkkPTIYmcHEEv86WRrQGzK4nEkf7qfXFVRrCwhlEVtffFFeawmaoLHQP5qdPJLugP_-8-OQJQqooDQ"
+      }
+    },
+    "unsupported_version": {
+      "data": { "address": "0x0000000000000000000000000000000000000001", "nested": { "empty": [], "unicode": "€ 😀" }, "sanctioned": false },
+      "attestation": {
+        "signed": true,
+        "schema_version": "onchaindiligence.attestation.v9",
+        "issuer": "https://api.onchaindiligence.com",
+        "purpose": "compliance-screening-result",
+        "issued_at": "2026-08-27T12:00:00.000Z",
+        "key_id": "ed25519-BuP9j9opu2CrWVV9",
+        "algorithm": "ed25519",
+        "canonicalization": "RFC8785",
+        "signature": "eZ6re44eR3zy8PXp93WJ7PDPRy-bovg5LNzh4uxjJpPIlhJIvOnWkSpTZIOPIJT9QG4GMRCiPL_jg9CHYtgtDQ"
+      }
+    }
+  },
+  "fixtures": [
+    { "id": "valid-v2-active", "expected_state": "VALID", "envelope": "valid_v2", "trust_records": ["active"] },
+    { "id": "valid-v2-retired", "expected_state": "VALID", "envelope": "valid_v2", "trust_records": ["retired"] },
+    { "id": "compromised-key", "expected_state": "INVALID", "envelope": "valid_v2", "trust_records": ["compromised"] },
+    { "id": "tampered-payload", "expected_state": "INVALID", "envelope": "tampered_payload", "trust_records": ["active"] },
+    { "id": "unknown-key", "expected_state": "UNVERIFIABLE", "envelope": "valid_v2", "trust_records": [] },
+    { "id": "valid-v1-legacy", "expected_state": "VALID", "envelope": "valid_v1", "trust_records": ["active"] },
+    { "id": "unsupported-version", "expected_state": "UNVERIFIABLE", "envelope": "unsupported_version", "trust_records": ["active"] }
+  ]
+}
