@@ -148,6 +148,15 @@ export function createFakeServer(options = {}) {
       const op = operations.get(operationId)
       const cred = headers.get('x-ocd-recovery-credential')
       if (!op || !cred || hashCredential(cred) !== op.recoveryCredentialHash) return json({ error: 'unknown operation or invalid recovery credential' }, 401)
+      // Mirrors onchaindiligence-mcp's real lifecycleFinalizeRoute.ts
+      // validation exactly (including its error message) -- this fake
+      // stood in for the real server without it, which is exactly why a
+      // real SDK/API vocabulary mismatch (CommerceExecutor's 'manual' vs
+      // the server's persisted 'none') was invisible to every offline test.
+      const rcc = bodyJson.recovery_capability_class
+      if (rcc !== 'provider-idempotent' && rcc !== 'stable-payment-identity' && rcc !== 'none') {
+        return json({ error: 'recovery_capability_class must be one of: provider-idempotent, stable-payment-identity, none' }, 400)
+      }
       const key = `${operationId}\0${bodyJson.client_submission_key}`
       let binding = executionBindings.get(key)
       let created = false

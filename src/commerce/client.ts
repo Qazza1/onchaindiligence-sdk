@@ -15,7 +15,7 @@
  * it is.
  */
 import type { CommerceAction, CommercePolicy, CommercePublication, OperationStatus, ReceiptEnvelope, PreflightResponseBody, ApiErrorBody, OperationFinalizeResponseBody } from './types.js'
-import type { CommerceExecutor, PrepareResult, ExecutionResult } from './executor.js'
+import type { CommerceExecutor, PrepareResult, ExecutionResult, ExecutorRecoveryMode } from './executor.js'
 import type { CommerceRecoveryStore, CommerceRecoveryRecord } from './recoveryStore.js'
 import { VersionConflictError } from './recoveryStore.js'
 import { type PreflightEvaluation, type ExecutionRecord, type FinalizeResult, type ResumeResult, pending } from './results.js'
@@ -57,6 +57,24 @@ export interface OpenParams {
 function mapExecutorIdToProvider(executorId: string | null): 'x402' | 'paybox' | 'wallet' | 'other' {
   if (executorId === 'x402-base-usdc-exact') return 'x402'
   return 'other'
+}
+
+/**
+ * CommerceExecutor's public `recoveryMode` ('provider-idempotent' |
+ * 'stable-payment-identity' | 'manual') and D2.4's persisted
+ * `recovery_capability_class` ('provider-idempotent' |
+ * 'stable-payment-identity' | 'none') name the SAME third state with
+ * different words -- the executor-facing API says 'manual' (there IS no
+ * automatic recovery capability, a human must look), the server's own
+ * enum says 'none' (neither of the two capability classes applies). Both
+ * carry the identical consequence (executionBinding.ts's own header:
+ * "an ambiguous outcome for this binding MUST resolve to
+ * 'manual-recovery-required' rather than a silent resubmission"). This is
+ * a narrow vocabulary adaptation at the SDK/API boundary, not a
+ * conflict -- translate here rather than renaming either persisted enum.
+ */
+function toRecoveryCapabilityClass(mode: ExecutorRecoveryMode): 'provider-idempotent' | 'stable-payment-identity' | 'none' {
+  return mode === 'manual' ? 'none' : mode
 }
 
 export class OnchainDiligenceCommerceClient {
@@ -454,7 +472,7 @@ export class CommerceOperation {
         client_submission_key: clientSubmissionKey,
         executor_identity: executor.id,
         executor_version: executor.version,
-        recovery_capability_class: executor.recoveryMode,
+        recovery_capability_class: toRecoveryCapabilityClass(executor.recoveryMode),
         expected_payer: null,
       }),
     })
