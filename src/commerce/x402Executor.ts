@@ -32,11 +32,14 @@
  */
 import { createPublicClient, http } from 'viem'
 import { base } from 'viem/chains'
-import type { Account } from 'viem'
 import { wrapFetchWithPayment } from '@x402/fetch'
 import { x402Client } from '@x402/core/client'
 import { ExactEvmScheme } from '@x402/evm/exact/client'
+import { toClientEvmSigner, type ClientEvmSigner } from '@x402/evm'
 import type { CommerceExecutor, PrepareContext, PrepareResult, ExecutionResult, ExecutorRecoveryMode } from './executor.js'
+
+export type { ClientEvmSigner }
+export { toClientEvmSigner }
 
 export const BASE_NETWORK = 'eip155:8453'
 export const BASE_USDC = '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913'
@@ -47,8 +50,17 @@ export interface MinimalResumeClient {
 }
 
 export interface X402ExecutorOptions {
-  /** A viem account that signs the EIP-3009 payment authorization. Never logged, never persisted by this class. */
-  account: Account
+  /**
+   * Signs the EIP-3009 payment authorization. Never logged, never persisted
+   * by this class. `@x402/evm`'s own ExactEvmScheme wants exactly this
+   * shape (address + signTypedData), NOT a full viem Account/WalletClient --
+   * that's deliberate: it's the one interface both a Node private-key
+   * signer (`toClientEvmSigner(privateKeyToAccount(pk))`, re-exported from
+   * this module) and a browser injected-wallet signer (hand-built around
+   * `walletClient.signTypedData`, since an injected wallet's viem account has
+   * no signing methods of its own) can equally satisfy.
+   */
+  signer: ClientEvmSigner
   /** Base RPC used ONLY for read-only resume confirmation. Defaults to the public Base RPC. */
   rpcUrl?: string
   fetch?: typeof globalThis.fetch
@@ -126,14 +138,20 @@ export class X402BaseUsdcExecutor implements CommerceExecutor {
   readonly version = 'v1'
   readonly recoveryMode: ExecutorRecoveryMode = 'manual'
 
-  private readonly account: Account
+  private readonly signer: ClientEvmSigner
   private readonly fetchImpl: typeof globalThis.fetch
   private readonly rpcUrl: string
   private readonly injectedPublicClient?: MinimalResumeClient
 
   constructor(options: X402ExecutorOptions) {
-    this.account = options.account
-    this.fetchImpl = options.fetch ?? globalThis.fetch
+    this.signer = options.signer
+    // See client.ts's constructor comment: a bare `globalThis.fetch`
+    // reference, later invoked as `this.fetchImpl(...)`, throws "Illegal
+    // invocation" in real browsers (detached from its required receiver) --
+    // invisible under Node, which is why this only surfaces against a real
+    // injected-wallet browser flow. Bind it here so this executor is safe to
+    // construct with no `fetch` option in either environment.
+    this.fetchImpl = options.fetch ?? globalThis.fetch.bind(globalThis)
     this.rpcUrl = options.rpcUrl ?? 'https://mainnet.base.org'
     this.injectedPublicClient = options.publicClient
   }
@@ -167,7 +185,7 @@ export class X402BaseUsdcExecutor implements CommerceExecutor {
 
   async submit(prepared: PrepareResult): Promise<ExecutionResult> {
     const ref = prepared.reference as X402PreparedReference
-    const client = new x402Client().register(ref.network as any, new ExactEvmScheme(this.account as any))
+    const client = new x402Client().register(ref.network as any, new ExactEvmScheme(this.signer))
     const payingFetch = wrapFetchWithPayment(this.fetchImpl, client)
 
     let res: Response

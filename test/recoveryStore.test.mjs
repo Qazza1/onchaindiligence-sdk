@@ -9,7 +9,8 @@ import assert from 'node:assert/strict'
 import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { NodeFileRecoveryStore, InMemoryRecoveryStore, RecoveryRecordExistsError, RecoveryRecordNotFoundError, VersionConflictError } from '../dist/commerce/index.js'
+import { InMemoryRecoveryStore, RecoveryRecordExistsError, RecoveryRecordNotFoundError, VersionConflictError } from '../dist/commerce/index.js'
+import { NodeFileRecoveryStore } from '../dist/commerce/nodeFileRecoveryStore.js'
 
 function baseRecord(operationId) {
   return {

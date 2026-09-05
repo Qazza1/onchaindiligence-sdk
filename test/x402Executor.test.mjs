@@ -12,9 +12,10 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { privateKeyToAccount } from 'viem/accounts'
-import { X402BaseUsdcExecutor, BASE_NETWORK, BASE_USDC } from '../dist/commerce/index.js'
+import { X402BaseUsdcExecutor, BASE_NETWORK, BASE_USDC, toClientEvmSigner } from '../dist/commerce/index.js'
 
 const TEST_ACCOUNT = privateKeyToAccount('0x0000000000000000000000000000000000000000000000000000000000000001')
+const TEST_SIGNER = toClientEvmSigner(TEST_ACCOUNT)
 const RESOURCE_URL = 'https://merchant.example/api/thing'
 const RECIPIENT = '0x63c347d7e42b940e79AfEC3D172bFc2921b6c897'
 const ATOMIC_AMOUNT = '10000' // $0.01 at 6 decimals
@@ -43,7 +44,7 @@ test('prepare() validates the challenge and never signs/pays', async () => {
     fetchCalls++
     return new Response(null, { status: 402, headers: { 'payment-required': base64utf8(validChallenge()) } })
   }
-  const executor = new X402BaseUsdcExecutor({ account: TEST_ACCOUNT, fetch: fakeFetch })
+  const executor = new X402BaseUsdcExecutor({ signer: TEST_SIGNER, fetch: fakeFetch })
   const prepared = await executor.prepare({ clientSubmissionKey: 'attempt-1', action: ACTION })
   assert.equal(prepared.clientSubmissionKey, 'attempt-1')
   assert.equal(fetchCalls, 1, 'prepare() must make exactly one read-only probe request, never more')
@@ -51,13 +52,13 @@ test('prepare() validates the challenge and never signs/pays', async () => {
 
 test('prepare() rejects a challenge quoting the wrong recipient before any signing could occur', async () => {
   const fakeFetch = async () => new Response(null, { status: 402, headers: { 'payment-required': base64utf8(validChallenge({ payTo: '0x1111111111111111111111111111111111111a' })) } })
-  const executor = new X402BaseUsdcExecutor({ account: TEST_ACCOUNT, fetch: fakeFetch })
+  const executor = new X402BaseUsdcExecutor({ signer: TEST_SIGNER, fetch: fakeFetch })
   await assert.rejects(() => executor.prepare({ clientSubmissionKey: 'attempt-1', action: ACTION }), /recipient mismatch/)
 })
 
 test('prepare() rejects a challenge quoting a different amount', async () => {
   const fakeFetch = async () => new Response(null, { status: 402, headers: { 'payment-required': base64utf8(validChallenge({ amount: '999999' })) } })
-  const executor = new X402BaseUsdcExecutor({ account: TEST_ACCOUNT, fetch: fakeFetch })
+  const executor = new X402BaseUsdcExecutor({ signer: TEST_SIGNER, fetch: fakeFetch })
   await assert.rejects(() => executor.prepare({ clientSubmissionKey: 'attempt-1', action: ACTION }), /amount mismatch/)
 })
 
@@ -70,7 +71,7 @@ test('submit() completes and extracts the transaction hash from the settlement r
     }
     return new Response(null, { status: 402, headers: { 'payment-required': base64utf8(validChallenge()) } })
   }
-  const executor = new X402BaseUsdcExecutor({ account: TEST_ACCOUNT, fetch: fakeFetch })
+  const executor = new X402BaseUsdcExecutor({ signer: TEST_SIGNER, fetch: fakeFetch })
   const prepared = await executor.prepare({ clientSubmissionKey: 'attempt-1', action: ACTION })
   const outcome = await executor.submit(prepared)
   assert.equal(outcome.status, 'transaction-known')
@@ -81,7 +82,7 @@ test('submit() reports submission-ambiguous, never throws unrecoverably, when no
   const fakeFetch = async () => {
     throw new Error('simulated network drop')
   }
-  const executor = new X402BaseUsdcExecutor({ account: TEST_ACCOUNT, fetch: fakeFetch })
+  const executor = new X402BaseUsdcExecutor({ signer: TEST_SIGNER, fetch: fakeFetch })
   // Skip prepare()'s own probe (it would also throw) -- construct the
   // PrepareResult directly to isolate submit()'s own ambiguous-handling.
   const prepared = { clientSubmissionKey: 'attempt-1', reference: { resourceUrl: RESOURCE_URL, network: BASE_NETWORK, asset: BASE_USDC, atomicAmount: ATOMIC_AMOUNT, recipient: RECIPIENT }, preparedAt: new Date().toISOString() }
@@ -99,7 +100,7 @@ test('D2.5 Section 15 #17: resume() preserves and re-confirms a known transactio
     return new Response(null, { status: 402, headers: { 'payment-required': base64utf8(validChallenge()) } })
   }
   const fakePublicClient = { getTransactionReceipt: async ({ hash }) => (hash === knownTxHash ? { status: 'success' } : Promise.reject(new Error('not found'))) }
-  const executor = new X402BaseUsdcExecutor({ account: TEST_ACCOUNT, fetch: fakeFetch, publicClient: fakePublicClient })
+  const executor = new X402BaseUsdcExecutor({ signer: TEST_SIGNER, fetch: fakeFetch, publicClient: fakePublicClient })
 
   const prepared = await executor.prepare({ clientSubmissionKey: 'attempt-1', action: ACTION })
   const priorOutcome = { clientSubmissionKey: 'attempt-1', status: 'transaction-known', transactionHash: knownTxHash }
@@ -112,7 +113,7 @@ test('D2.5 Section 15 #17: resume() preserves and re-confirms a known transactio
 
 test('resume() with no prior transaction hash honestly reports manual-recovery-required', async () => {
   const fakeFetch = async () => new Response(null, { status: 402, headers: { 'payment-required': base64utf8(validChallenge()) } })
-  const executor = new X402BaseUsdcExecutor({ account: TEST_ACCOUNT, fetch: fakeFetch })
+  const executor = new X402BaseUsdcExecutor({ signer: TEST_SIGNER, fetch: fakeFetch })
   const prepared = await executor.prepare({ clientSubmissionKey: 'attempt-1', action: ACTION })
   const resumed = await executor.resume(prepared)
   assert.equal(resumed.status, 'manual-recovery-required')
@@ -123,7 +124,7 @@ test('resume() reports ambiguous (not a fabricated failure) when the known hash 
   const knownTxHash = '0x' + 'ef'.repeat(32)
   const fakeFetch = async () => new Response(null, { status: 402, headers: { 'payment-required': base64utf8(validChallenge()) } })
   const fakePublicClient = { getTransactionReceipt: async () => Promise.reject(new Error('not found')) }
-  const executor = new X402BaseUsdcExecutor({ account: TEST_ACCOUNT, fetch: fakeFetch, publicClient: fakePublicClient })
+  const executor = new X402BaseUsdcExecutor({ signer: TEST_SIGNER, fetch: fakeFetch, publicClient: fakePublicClient })
   const prepared = await executor.prepare({ clientSubmissionKey: 'attempt-1', action: ACTION })
   const resumed = await executor.resume(prepared, { clientSubmissionKey: 'attempt-1', status: 'transaction-known', transactionHash: knownTxHash })
   assert.equal(resumed.status, 'submission-ambiguous', 'not-yet-found must stay ambiguous, never be reported as a definitive failure')

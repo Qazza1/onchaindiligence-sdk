@@ -94,7 +94,8 @@ never replaces your executor's own authorization — see
 [`CommerceExecutor`](src/commerce/executor.ts).
 
 ```ts
-import { createCommerceClient, NodeFileRecoveryStore, MockCommerceExecutor, apiPurchasePolicy } from '@onchaindiligence/sdk/commerce'
+import { createCommerceClient, MockCommerceExecutor, apiPurchasePolicy } from '@onchaindiligence/sdk/commerce'
+import { NodeFileRecoveryStore } from '@onchaindiligence/sdk/commerce/node' // Node-only; browser code implements CommerceRecoveryStore itself
 
 const ocd = createCommerceClient({ recovery: new NodeFileRecoveryStore('./ocd-recovery') })
 
@@ -104,7 +105,7 @@ const op = await ocd.open({ action: proposedPayment, policy })
 const evaluation = await op.preflight()
 if (evaluation.kind === 'blocked' || evaluation.kind === 'approval-required') return handleThat(evaluation)
 
-const execution = await op.execute({ executor: myExecutor }) // e.g. new X402BaseUsdcExecutor({ account })
+const execution = await op.execute({ executor: myExecutor }) // e.g. new X402BaseUsdcExecutor({ signer: toClientEvmSigner(account) })
 if (execution.kind !== 'execution-recorded') return handleThat(execution)
 
 const result = await op.observeAndFinalize() // safe to retry while kind === 'pending'
@@ -123,7 +124,7 @@ Key pieces:
 | `CommerceExecutor` | The contract your wallet/payment provider implements: `prepare` → `submit` → `resume`. Independent of OCD's policy decision by construction. |
 | `X402BaseUsdcExecutor` | The one production executor: Base mainnet, USDC, x402 v2 exact. Its `recoveryMode` is honestly `'manual'` — see the file's own header for why. |
 | `MockCommerceExecutor` | Deterministic, no-network executor for tests/docs. |
-| `CommerceRecoveryStore` | Durable identity storage — required, no safe default. `NodeFileRecoveryStore` survives a restart; implement the interface against your own database for a multi-instance deployment. `InMemoryRecoveryStore` is test-only. |
+| `CommerceRecoveryStore` | Durable identity storage — required, no safe default. `NodeFileRecoveryStore` (`@onchaindiligence/sdk/commerce/node` — Node-only, wraps `node:fs`) survives a restart; implement the interface against your own database for a multi-instance deployment, or proxy it through your own local server for a browser UI (never store the secret fields in browser storage). `InMemoryRecoveryStore` is test-only. |
 | `apiPurchasePolicy` / `approvalAboveThresholdPolicy` / `fixedRecipientPolicy` | Three starter policy templates — ordinary strict policy objects, no new semantics. |
 | `buildEvidenceExport` | A minimal, deterministic, secret-free evidence manifest. |
 | `client.getReceipt()` / `client.verifyReceipt()` | Free, structured, reuse OCD's converged verification contract — a convenience, not a stronger trust model than verifying offline yourself. |

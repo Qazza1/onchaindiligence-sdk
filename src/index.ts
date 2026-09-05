@@ -202,8 +202,14 @@ export async function resolveAttestationKeyOnline(
   options: { baseUrl?: string; fetch?: typeof globalThis.fetch } = {}
 ): Promise<AttestationKeyRecord> {
   const baseUrl = (options.baseUrl ?? DEFAULT_BASE_URL).replace(/\/$/, '')
-  const fetchImpl = options.fetch ?? globalThis.fetch
-  if (!fetchImpl) throw new Error('fetch is unavailable in this runtime')
+  if (!options.fetch && !globalThis.fetch) throw new Error('fetch is unavailable in this runtime')
+  // `globalThis.fetch` is a WebIDL operation on the global object -- calling
+  // it through ANY indirection (a local variable, a class property) other
+  // than the bare `fetch(...)` identifier detaches it from its required
+  // receiver, which throws "Illegal invocation" in real browsers (invisible
+  // under Node, which does not enforce this). Binding to globalThis is what
+  // makes storing/passing it around safe.
+  const fetchImpl = options.fetch ?? globalThis.fetch.bind(globalThis)
 
   const exact = await fetchImpl(
     `${baseUrl}/.well-known/attestation-keys/${encodeURIComponent(keyId)}`

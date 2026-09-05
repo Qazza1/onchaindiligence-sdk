@@ -1,3 +1,11 @@
+/**
+ * mockExecutor.ts — a deterministic, no-network CommerceExecutor for the
+ * quickstart and tests. It never touches a chain and never moves money;
+ * every outcome is scripted so documentation and tests can demonstrate the
+ * FULL lifecycle without a live payment, per D2.5's own mandate ("Use a
+ * mocked/test executor for the normal quickstart so running documentation
+ * does not cost money").
+ */
 import type { CommerceExecutor, PrepareContext, PrepareResult, ExecutionResult, ExecutorRecoveryMode } from './executor.js';
 export type MockOutcomeScript = {
     kind: 'success';

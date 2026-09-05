@@ -6,7 +6,6 @@
  * mocked/test executor for the normal quickstart so running documentation
  * does not cost money").
  */
-import { randomBytes } from 'node:crypto'
 import type { CommerceExecutor, PrepareContext, PrepareResult, ExecutionResult, ExecutorRecoveryMode } from './executor.js'
 
 export type MockOutcomeScript =
@@ -20,8 +19,11 @@ export interface MockExecutorOptions {
   script?: MockOutcomeScript
 }
 
+/** Universal (Node + browser) random hex via Web Crypto -- this file must stay bundle-safe for a browser operator, unlike nodeFileRecoveryStore.ts. */
 function fakeTransactionHash(): string {
-  return '0x' + randomBytes(32).toString('hex')
+  const bytes = new Uint8Array(32)
+  globalThis.crypto.getRandomValues(bytes)
+  return '0x' + Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('')
 }
 
 /**

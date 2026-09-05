@@ -5,8 +5,10 @@
  *
  * Uses a MOCKED executor (never touches a chain, never moves money) so this
  * file is safe to run as documentation. To pay for real, swap
- * MockCommerceExecutor for X402BaseUsdcExecutor with a real funded viem
- * Account — nothing else in this file changes.
+ * MockCommerceExecutor for X402BaseUsdcExecutor with a real funded signer
+ * (`toClientEvmSigner(privateKeyToAccount(pk))` for Node, or a hand-built
+ * ClientEvmSigner around an injected wallet's `signTypedData` in a browser)
+ * — nothing else in this file changes.
  *
  * This is the ~20-line integration the SDK exists to make possible:
  *

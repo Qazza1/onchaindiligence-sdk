@@ -35,6 +35,8 @@ import { base } from 'viem/chains';
 import { wrapFetchWithPayment } from '@x402/fetch';
 import { x402Client } from '@x402/core/client';
 import { ExactEvmScheme } from '@x402/evm/exact/client';
+import { toClientEvmSigner } from '@x402/evm';
+export { toClientEvmSigner };
 export const BASE_NETWORK = 'eip155:8453';
 export const BASE_USDC = '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913';
 function base64ToUtf8(base64) {
@@ -102,13 +104,19 @@ export class X402BaseUsdcExecutor {
     id = 'x402-base-usdc-exact';
     version = 'v1';
     recoveryMode = 'manual';
-    account;
+    signer;
     fetchImpl;
     rpcUrl;
     injectedPublicClient;
     constructor(options) {
-        this.account = options.account;
-        this.fetchImpl = options.fetch ?? globalThis.fetch;
+        this.signer = options.signer;
+        // See client.ts's constructor comment: a bare `globalThis.fetch`
+        // reference, later invoked as `this.fetchImpl(...)`, throws "Illegal
+        // invocation" in real browsers (detached from its required receiver) --
+        // invisible under Node, which is why this only surfaces against a real
+        // injected-wallet browser flow. Bind it here so this executor is safe to
+        // construct with no `fetch` option in either environment.
+        this.fetchImpl = options.fetch ?? globalThis.fetch.bind(globalThis);
         this.rpcUrl = options.rpcUrl ?? 'https://mainnet.base.org';
         this.injectedPublicClient = options.publicClient;
     }
@@ -141,7 +149,7 @@ export class X402BaseUsdcExecutor {
     }
     async submit(prepared) {
         const ref = prepared.reference;
-        const client = new x402Client().register(ref.network, new ExactEvmScheme(this.account));
+        const client = new x402Client().register(ref.network, new ExactEvmScheme(this.signer));
         const payingFetch = wrapFetchWithPayment(this.fetchImpl, client);
         let res;
         try {

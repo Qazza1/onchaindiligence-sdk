@@ -1,14 +1,8 @@
-/**
- * mockExecutor.ts — a deterministic, no-network CommerceExecutor for the
- * quickstart and tests. It never touches a chain and never moves money;
- * every outcome is scripted so documentation and tests can demonstrate the
- * FULL lifecycle without a live payment, per D2.5's own mandate ("Use a
- * mocked/test executor for the normal quickstart so running documentation
- * does not cost money").
- */
-import { randomBytes } from 'node:crypto';
+/** Universal (Node + browser) random hex via Web Crypto -- this file must stay bundle-safe for a browser operator, unlike nodeFileRecoveryStore.ts. */
 function fakeTransactionHash() {
-    return '0x' + randomBytes(32).toString('hex');
+    const bytes = new Uint8Array(32);
+    globalThis.crypto.getRandomValues(bytes);
+    return '0x' + Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('');
 }
 /**
  * A minimal, fully in-memory executor. `prepare()` just records the frozen

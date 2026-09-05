@@ -68,7 +68,14 @@ export class OnchainDiligenceCommerceClient {
   constructor(options: CreateCommerceClientOptions) {
     this.endpoint = (options.endpoint ?? DEFAULT_ENDPOINT).replace(/\/$/, '')
     this.recovery = options.recovery
-    this.fetchImpl = options.fetch ?? globalThis.fetch
+    // `globalThis.fetch` is a WebIDL operation on the global object -- storing
+    // the bare reference and later invoking it as `this.fetchImpl(...)`
+    // detaches it from its required receiver, which throws "Illegal
+    // invocation" in real browsers (Node's implementation does not enforce
+    // this, so this bug is invisible to every Node-based test). Binding to
+    // globalThis here is what makes this constructor safe to use unmodified
+    // in both a browser and Node without the caller ever having to know.
+    this.fetchImpl = options.fetch ?? globalThis.fetch.bind(globalThis)
     this.trust = options.trust ?? {}
   }
 
