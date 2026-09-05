@@ -161,7 +161,7 @@ export function createFakeServer(options = {}) {
       let binding = executionBindings.get(key)
       let created = false
       if (!binding) {
-        binding = { executionRequestId: randomId('OCD-EXEC-'), submissionState: 'not_submitted' }
+        binding = { executionRequestId: randomId('OCD-EXEC-'), submissionState: 'not_submitted', providerReference: bodyJson.provider_reference ?? null }
         executionBindings.set(key, binding)
         executionBindings.set(binding.executionRequestId, binding)
         created = true
@@ -244,5 +244,6 @@ export function createFakeServer(options = {}) {
   return {
     fetch: fetchImpl,
     stats: () => ({ preflightAttempts, executeSubmitAttempts }),
+    getExecutionBinding: (executionRequestId) => executionBindings.get(executionRequestId) ?? null,
   }
 }

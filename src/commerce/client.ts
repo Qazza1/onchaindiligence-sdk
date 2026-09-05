@@ -56,6 +56,7 @@ export interface OpenParams {
 
 function mapExecutorIdToProvider(executorId: string | null): 'x402' | 'paybox' | 'wallet' | 'other' {
   if (executorId === 'x402-base-usdc-exact') return 'x402'
+  if (executorId === 'paybox-x402-base-usdc') return 'paybox'
   return 'other'
 }
 
@@ -474,6 +475,11 @@ export class CommerceOperation {
         executor_version: executor.version,
         recovery_capability_class: toRecoveryCapabilityClass(executor.recoveryMode),
         expected_payer: null,
+        // D2.6: forwarded verbatim into the D2.4 execution binding (and from
+        // there, the lifecycle evidence bundle) so a third-party executor's
+        // own request identity (e.g. a PayBox request id) is durably
+        // correlated to this OCD operation — see PrepareResult.providerReference.
+        provider_reference: prepared.providerReference ?? null,
       }),
     })
     if (!bindingRes.ok) {

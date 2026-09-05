@@ -1,7 +1,9 @@
 import { toClientEvmSigner, type ClientEvmSigner } from '@x402/evm';
 import type { CommerceExecutor, PrepareContext, PrepareResult, ExecutionResult, ExecutorRecoveryMode } from './executor.js';
+import { X402ChallengeError } from './x402Challenge.js';
 export type { ClientEvmSigner };
 export { toClientEvmSigner };
+export { X402ChallengeError };
 export declare const BASE_NETWORK = "eip155:8453";
 export declare const BASE_USDC = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913";
 /** The subset of viem's PublicClient resume() actually calls -- narrowed so tests can inject a minimal fake instead of a real RPC connection. */

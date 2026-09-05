@@ -31,6 +31,20 @@ export interface PrepareResult {
   /** Executor-specific durable reference to what was prepared (e.g. a validated 402 challenge) — opaque to the orchestrator, round-tripped back into submit()/resume() unchanged. */
   reference: unknown
   preparedAt: string
+  /**
+   * Optional third-party execution-provider reference established at
+   * prepare() time (e.g. a PayBox request id, a payment processor's
+   * transaction reference) — UNLIKE `reference`, this is NOT opaque: the
+   * orchestrator forwards it verbatim as `provider_reference` on the
+   * execution-bindings call (D2.6), so it becomes part of the durable
+   * server-side binding and, from there, the D2.4 lifecycle evidence bundle
+   * — letting a receipt reader say "provider request X was associated with
+   * this OCD lifecycle" without OCD ever needing to understand what that
+   * provider's reference means. Omit when the executor has no such
+   * provider-issued identity (e.g. a local wallet signer like
+   * X402BaseUsdcExecutor).
+   */
+  providerReference?: string | null
 }
 
 export type ExecutionOutcome =

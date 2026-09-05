@@ -24,6 +24,7 @@ export * from './executor.js';
 export * from './recoveryStore.js';
 export * from './mockExecutor.js';
 export * from './x402Executor.js';
+export * from './payboxExecutor.js';
 export * from './client.js';
 export * from './policyTemplates.js';
 export * from './evidenceExport.js';
