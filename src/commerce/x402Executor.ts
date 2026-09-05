@@ -76,8 +76,22 @@ interface X402PreparedReference {
   recipient: string
 }
 
+/**
+ * `Buffer` is a Node global, not a browser one -- calling `Buffer.from(...)`
+ * here used to throw `ReferenceError: Buffer is not defined` in a real
+ * browser (confirmed live, D2.5A: a real OneSource 402 challenge, valid and
+ * byte-identical through the local proxy, failed to decode). That
+ * ReferenceError was thrown INSIDE decodeChallenge()'s try/catch below and
+ * silently relabeled as "Payment-Required header was not base64-encoded
+ * JSON" -- a misleading error that looks like a merchant-format problem but
+ * isn't one. `atob`/`TextDecoder` are the browser-safe equivalents (both
+ * also globally available in Node), mirroring lifecycleCore.ts's own
+ * isomorphic decodeChallenge in onchaindiligence-mcp exactly.
+ */
 function base64ToUtf8(base64: string): string {
-  return Buffer.from(base64, 'base64').toString('utf8')
+  const binary = atob(base64)
+  const bytes = Uint8Array.from(binary, (c) => c.charCodeAt(0))
+  return new TextDecoder().decode(bytes)
 }
 
 class X402ChallengeError extends Error {}
