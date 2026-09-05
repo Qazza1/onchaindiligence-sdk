@@ -559,13 +559,22 @@ export class CommerceOperation {
     }
 
     const body = (await res.json()) as OperationFinalizeResponseBody
+    // The server's finalize response is `{...envelope, ocd_lifecycle_evidence}`
+    // -- a convenience shape for THIS transport, never the canonical Public
+    // Action Receipt v1 envelope itself. Extract exactly {schema, receipt,
+    // proof} before this touches anything that expects that canonical shape
+    // (verifyReceipt(), and whatever the caller does with the returned
+    // receipt) -- passing the enriched `body` through unchanged made the
+    // canonical verifier reject a genuinely valid, correctly-signed receipt
+    // as schema-invalid (confirmed live, D2.5A).
+    const envelope: ReceiptEnvelope = { schema: body.schema, receipt: body.receipt, proof: body.proof }
     await this.casUpdate({ localPhase: 'finalized' })
     if (this.client.trustOptions().verifyReceipts) {
-      await this.client.verifyReceipt(body).catch(() => {})
+      await this.client.verifyReceipt(envelope).catch(() => {})
     }
-    this.lastCommerceReceiptId = body.receipt.receipt_id
+    this.lastCommerceReceiptId = envelope.receipt.receipt_id
     this.lastLifecycleEvidence = body.ocd_lifecycle_evidence
-    return { kind: 'receipt-produced', operationId: this.operationId, receipt: body, evidence: body.ocd_lifecycle_evidence }
+    return { kind: 'receipt-produced', operationId: this.operationId, receipt: envelope, evidence: body.ocd_lifecycle_evidence }
   }
 
   // --- evidence export (D2.5 Section 10) ----------------------------------

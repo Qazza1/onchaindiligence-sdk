@@ -223,6 +223,18 @@ export function createFakeServer(options = {}) {
     }
 
     if (path === '/verify-receipt' && method === 'POST') {
+      // Mirrors onchaindiligence-mcp's real closed-schema check (receipts.ts's
+      // closedKeys/validateReceiptShape: additionalProperties:false on the
+      // envelope) for exactly the field this fake needs to catch -- an
+      // envelope enriched with anything beyond {schema, receipt, proof} is
+      // schema-invalid there, and unconditionally returning VALID here (as
+      // this used to) is exactly why that was invisible to every SDK test.
+      const envelope = bodyJson.envelope
+      if (envelope && typeof envelope === 'object') {
+        const allowed = new Set(['schema', 'receipt', 'proof'])
+        const extra = Object.keys(envelope).find((k) => !allowed.has(k))
+        if (extra) return json({ state: 'INVALID', code: 'schema-invalid', message: `envelope has an unexpected field: ${extra}` })
+      }
       return json({ state: 'VALID', code: 'ok', message: 'fake verification' })
     }
 
