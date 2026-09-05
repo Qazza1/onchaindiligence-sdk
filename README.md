@@ -2,6 +2,8 @@
 
 A small, typed client for the [OnchainDiligence](https://onchaindiligence.com) compliance API. It hides the HTTP `402` pay-per-call flow entirely: you configure a funded account once, and every method transparently answers the payment challenge, settles on Tempo, and returns a typed, signed result.
 
+A separate `@onchaindiligence/sdk/commerce` export orchestrates an *agent's own merchant payment lifecycle* (open → preflight → execute → observe/finalize) against `mcp.onchaindiligence.com` — see [Commerce client](#commerce-client-agent-payments) below.
+
 ```bash
 npm install @onchaindiligence/sdk mppx viem
 ```
@@ -74,6 +76,62 @@ Every paid response is a `Signed<T>` — the result plus an `attestation` you ca
 | `health()` | service status | free |
 
 Errors throw `OnchainDiligenceError` with the HTTP `status` and a message.
+
+## Commerce client (agent payments)
+
+```bash
+npm install @onchaindiligence/sdk
+```
+
+A separate, `@onchaindiligence/sdk/commerce` export orchestrates an agent's
+merchant payment lifecycle against `mcp.onchaindiligence.com`:
+
+> **Keep your wallet. Keep your payment provider. Add OCD once.**
+
+OCD evaluates a proposed payment against your policy and observes/reconciles
+what actually settled. It never holds a key, never authorizes a payment, and
+never replaces your executor's own authorization — see
+[`CommerceExecutor`](src/commerce/executor.ts).
+
+```ts
+import { createCommerceClient, NodeFileRecoveryStore, MockCommerceExecutor, apiPurchasePolicy } from '@onchaindiligence/sdk/commerce'
+
+const ocd = createCommerceClient({ recovery: new NodeFileRecoveryStore('./ocd-recovery') })
+
+const { policy } = apiPurchasePolicy({ maxAmount: '1.00', allowedNetwork: 'eip155:8453', allowedAsset: BASE_USDC })
+const op = await ocd.open({ action: proposedPayment, policy })
+
+const evaluation = await op.preflight()
+if (evaluation.kind === 'blocked' || evaluation.kind === 'approval-required') return handleThat(evaluation)
+
+const execution = await op.execute({ executor: myExecutor }) // e.g. new X402BaseUsdcExecutor({ account })
+if (execution.kind !== 'execution-recorded') return handleThat(execution)
+
+const result = await op.observeAndFinalize() // safe to retry while kind === 'pending'
+console.log(result.receipt.receipt.execution.status) // read the fact, never infer "success" from existence
+```
+
+See **[examples/quickstart.ts](examples/quickstart.ts)** for the complete,
+runnable, ~20-line integration (uses a mocked executor and an in-process demo
+server — `npx tsx examples/quickstart.ts` costs nothing and needs no wallet).
+
+Key pieces:
+
+| Export | What it is |
+|---|---|
+| `createCommerceClient` / `CommerceOperation` | Orchestrates open → preflight → execute → observe/finalize. |
+| `CommerceExecutor` | The contract your wallet/payment provider implements: `prepare` → `submit` → `resume`. Independent of OCD's policy decision by construction. |
+| `X402BaseUsdcExecutor` | The one production executor: Base mainnet, USDC, x402 v2 exact. Its `recoveryMode` is honestly `'manual'` — see the file's own header for why. |
+| `MockCommerceExecutor` | Deterministic, no-network executor for tests/docs. |
+| `CommerceRecoveryStore` | Durable identity storage — required, no safe default. `NodeFileRecoveryStore` survives a restart; implement the interface against your own database for a multi-instance deployment. `InMemoryRecoveryStore` is test-only. |
+| `apiPurchasePolicy` / `approvalAboveThresholdPolicy` / `fixedRecipientPolicy` | Three starter policy templates — ordinary strict policy objects, no new semantics. |
+| `buildEvidenceExport` | A minimal, deterministic, secret-free evidence manifest. |
+| `client.getReceipt()` / `client.verifyReceipt()` | Free, structured, reuse OCD's converged verification contract — a convenience, not a stronger trust model than verifying offline yourself. |
+
+Every lifecycle result is a discriminated union (`evaluation.kind`,
+`execution.kind`, `result.kind`) — `'pending'` states carry a machine-readable
+`safeNextAction`, `retryAfterSeconds`, and `mayAlreadyHavePaid`, so a `pending`
+outcome is never confused with failure or with "safe to pay again."
 
 ## Offline verification
 
