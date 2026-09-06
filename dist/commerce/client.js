@@ -4,6 +4,20 @@ import { buildEvidenceExport } from './evidenceExport.js';
 const DEFAULT_ENDPOINT = 'https://mcp.onchaindiligence.com';
 const OPERATION_HEADER = 'x-ocd-operation-id';
 const RECOVERY_HEADER = 'x-ocd-recovery-credential';
+/**
+ * D2.6 review fix #1: thrown by execute() whenever the operation's
+ * authoritative stored PREFLIGHT decision is not ALLOW (BLOCK,
+ * REQUIRE_APPROVAL, UNKNOWN, or — defensively — undeterminable). This is the
+ * generic, executor-independent enforcement point: no executor (PayBox,
+ * X402BaseUsdcExecutor, a custom one) is ever reachable from execute() for
+ * an operation that didn't authoritatively reach ALLOW.
+ */
+export class PreflightNotAllowedError extends Error {
+    constructor(operationId, status) {
+        super(`cannot execute operation ${operationId}: its stored PREFLIGHT decision is "${status ?? 'unknown'}", not ALLOW -- no executor may be invoked`);
+        this.name = 'PreflightNotAllowedError';
+    }
+}
 export class RecoveryRequiredError extends Error {
     constructor(operationId) {
         super(`no local recovery record for operation ${operationId} -- call client.resume(operationId, recoveryCredential) with the credential you saved when this operation was opened. Never silently start a replacement purchase.`);
@@ -96,6 +110,7 @@ export class OnchainDiligenceCommerceClient {
             operationId: created.operation_id,
             recoveryCredential: created.recovery_credential,
             preflightReceiptId: null,
+            preflightDecisionStatus: null,
             finalizationCapability: null,
             finalizationCapabilityExpiresAt: null,
             executionRequestId: null,
@@ -123,6 +138,9 @@ export class OnchainDiligenceCommerceClient {
                 operationId,
                 recoveryCredential,
                 preflightReceiptId: status.preflight_receipt_id,
+                // Not known from OperationStatus alone -- execute() re-fetches the
+                // authoritative receipt when this is null (see assertPreflightAllowed()).
+                preflightDecisionStatus: null,
                 finalizationCapability: null,
                 finalizationCapabilityExpiresAt: null,
                 executionRequestId: null,
@@ -190,6 +208,27 @@ export class CommerceOperation {
         if (fresh)
             this.record = fresh;
     }
+    /**
+     * Fail-closed gate (D2.6 review fix #1): execute() calls this before ANY
+     * executor method is reachable. Prefers the locally cached
+     * `preflightDecisionStatus` (set the moment preflight() itself received an
+     * authoritative decision) — falls back to re-fetching the signed receipt
+     * itself for a record that predates this field, or whose cache write
+     * never landed, rather than ever assuming ALLOW.
+     */
+    async assertPreflightAllowed() {
+        if (!this.record.preflightReceiptId) {
+            throw new Error('cannot execute before a READY preflight -- call op.preflight() first and confirm evaluation.kind === "ready"');
+        }
+        let status = this.record.preflightDecisionStatus;
+        if (!status) {
+            const receipt = await this.client.getReceipt(this.record.preflightReceiptId);
+            status = receipt?.receipt.decision.status ?? null;
+        }
+        if (status !== 'ALLOW') {
+            throw new PreflightNotAllowedError(this.operationId, status);
+        }
+    }
     async casUpdate(patch) {
         for (let attempt = 0; attempt < 3; attempt++) {
             try {
@@ -255,8 +294,12 @@ export class CommerceOperation {
             // the record and there is nothing left to evaluate.
             if (this.record.preflightReceiptId) {
                 const receipt = await this.client.getReceipt(this.record.preflightReceiptId);
-                if (receipt)
+                if (receipt) {
+                    if (this.record.preflightDecisionStatus !== receipt.receipt.decision.status) {
+                        await this.casUpdate({ preflightDecisionStatus: receipt.receipt.decision.status }).catch(() => { }); // best-effort cache fill; assertPreflightAllowed() re-fetches if this never lands
+                    }
                     return this.evaluationFromReceipt(receipt, null);
+                }
             }
             throw new Error('no pending preflight input for this operation -- after a restart, call client.open({operationId, action, policy}) to re-supply it before calling preflight() again');
         }
@@ -299,6 +342,7 @@ export class CommerceOperation {
         const result = (await res.json());
         await this.casUpdate({
             preflightReceiptId: result.receipt.receipt.receipt_id,
+            preflightDecisionStatus: result.receipt.receipt.decision.status,
             finalizationCapability: result.finalization.capability,
             finalizationCapabilityExpiresAt: result.finalization.expires_at,
             localPhase: 'preflight-complete',
@@ -360,6 +404,15 @@ export class CommerceOperation {
         // this one sharing the same durable store) may have already claimed or
         // advanced this operation since we last loaded it.
         await this.reload();
+        // D2.6 review fix #1: the ONLY gate that matters is the operation's
+        // actual stored PREFLIGHT decision -- not a caller's evaluation.kind
+        // check, which is application-level discipline this class cannot see or
+        // enforce. preflightReceiptId alone is not sufficient: it is set for
+        // BLOCK and REQUIRE_APPROVAL exactly as it is for ALLOW. Fail closed on
+        // anything that isn't an authoritative ALLOW, before prepare()/submit()/
+        // resume() is ever reachable -- this runs on EVERY execute() call
+        // (including a resumed in-flight submission), not just the first.
+        await this.assertPreflightAllowed();
         // Resuming an in-flight submission: never re-prepare/re-submit.
         if (this.record.clientSubmissionKey && this.record.executionRequestId) {
             if (this.record.transactionHash) {

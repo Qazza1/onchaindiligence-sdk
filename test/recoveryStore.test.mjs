@@ -17,6 +17,7 @@ function baseRecord(operationId) {
     operationId,
     recoveryCredential: 'test-credential-value',
     preflightReceiptId: null,
+    preflightDecisionStatus: null,
     finalizationCapability: null,
     finalizationCapabilityExpiresAt: null,
     executionRequestId: null,

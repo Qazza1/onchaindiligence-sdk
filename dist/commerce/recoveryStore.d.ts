@@ -29,6 +29,18 @@ export interface CommerceRecoveryRecord {
     createdAt: string;
     updatedAt: string;
     preflightReceiptId: string | null;
+    /**
+     * The stored PREFLIGHT receipt's `decision.status`, exactly as returned by
+     * the server, recorded the moment preflight() succeeds — this is what
+     * CommerceOperation.execute() checks (fail-closed) before ever calling an
+     * executor, so BLOCK/REQUIRE_APPROVAL/UNKNOWN can never reach
+     * prepare()/submit()/resume() merely because a caller forgot to check
+     * evaluation.kind themselves (D2.6 review fix #1). `null` until a
+     * preflight decision is known, or for a record created before this field
+     * existed — execute() re-fetches the authoritative receipt in that case
+     * rather than assuming ALLOW.
+     */
+    preflightDecisionStatus: 'ALLOW' | 'REQUIRE_APPROVAL' | 'BLOCK' | 'UNKNOWN' | null;
     /** The one-time finalization capability token, when known. Never log this. */
     finalizationCapability: string | null;
     finalizationCapabilityExpiresAt: string | null;

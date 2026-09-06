@@ -55,12 +55,43 @@ export interface PayBoxRequestRecord {
 export interface PayBoxRequestStore {
     get(clientSubmissionKey: string): Promise<PayBoxRequestRecord | null>;
     set(record: PayBoxRequestRecord): Promise<void>;
+    /**
+     * Atomically claims the attempt slot for `clientSubmissionKey` (D2.6
+     * review fix #3): if no record exists yet, stores `placeholder` (which
+     * MUST have `payboxRequestId: null`) and returns `{ claimed: true, record:
+     * placeholder }` -- the caller, and ONLY the caller, may now call
+     * `pay_x402` for this key. If a record already exists (whether still in
+     * the ambiguous pre-request-id window, or already holding a
+     * `payboxRequestId`), returns `{ claimed: false, record: <the existing
+     * record, unmodified> }` and the caller MUST NOT call `pay_x402`.
+     *
+     * This is the ONE operation in this interface that a real, multi-process
+     * implementation MUST make genuinely atomic (e.g. a SQL `INSERT ... ON
+     * CONFLICT DO NOTHING` followed by a `SELECT`, or an equivalent
+     * conditional-put) -- the same discipline as `CommerceRecoveryStore.create()`
+     * throwing `RecoveryRecordExistsError` rather than silently overwriting.
+     * `InMemoryPayBoxRequestStore`'s implementation is atomic only because a
+     * single JS `Map` access with no `await` in between can never interleave
+     * with another call in the same process.
+     */
+    claim(clientSubmissionKey: string, placeholder: PayBoxRequestRecord): Promise<{
+        claimed: boolean;
+        record: PayBoxRequestRecord;
+    }>;
 }
 /** Volatile, single-process, TEST/EXAMPLE-ONLY implementation -- same discipline as recoveryStore.ts's InMemoryRecoveryStore. Does not survive a restart; a real deployment must implement this against durable storage. */
 export declare class InMemoryPayBoxRequestStore implements PayBoxRequestStore {
     private readonly records;
     get(clientSubmissionKey: string): Promise<PayBoxRequestRecord | null>;
     set(record: PayBoxRequestRecord): Promise<void>;
+    claim(clientSubmissionKey: string, placeholder: PayBoxRequestRecord): Promise<{
+        claimed: boolean;
+        record: PayBoxRequestRecord;
+    }>;
+}
+/** Thrown by the PayBoxCommerceExecutor constructor when no durable store was supplied (D2.6 review fix #2). */
+export declare class PayBoxStoreRequiredError extends Error {
+    constructor();
 }
 /** Thrown by prepare() when a PRIOR attempt for this exact clientSubmissionKey called pay_x402 but this process never learned the outcome -- see this file's header for why this cannot be silently retried. */
 export declare class PayBoxAmbiguousPrepareError extends Error {
@@ -71,8 +102,17 @@ export interface PayBoxExecutorOptions {
     paybox: PayBoxClient;
     /** The single PayBox wallet-kind credential this executor pays from (Section 2: one credential, one operation at a time for the reference flow). */
     credentialId: string;
-    /** Durable store for this adapter's own request identity. Defaults to an in-memory store -- REQUIRED to be durable (e.g. backed by the same storage as your CommerceRecoveryStore) for real crash/restart recovery, exactly like recoveryStore.ts's own default. */
-    store?: PayBoxRequestStore;
+    /**
+     * Durable store for this adapter's own request identity -- REQUIRED, no
+     * default (D2.6 review fix #2). This class advertises
+     * `recoveryMode: 'stable-payment-identity'`, which is only true if the
+     * PayBox request_id genuinely survives a restart; silently defaulting to
+     * `InMemoryPayBoxRequestStore` would make that claim false the moment the
+     * process restarts. `InMemoryPayBoxRequestStore` remains available for
+     * tests/examples but must be passed explicitly, exactly like
+     * `CommerceRecoveryStore` has no safe default either.
+     */
+    store: PayBoxRequestStore;
     fetch?: typeof globalThis.fetch;
     /** Base RPC used ONLY for read-only resume confirmation of an already-known transaction hash. Defaults to the public Base RPC. */
     rpcUrl?: string;

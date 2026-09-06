@@ -19,6 +19,17 @@ import type { CommerceExecutor } from './executor.js';
 import type { CommerceRecoveryStore, CommerceRecoveryRecord } from './recoveryStore.js';
 import { type PreflightEvaluation, type ExecutionRecord, type FinalizeResult, type ResumeResult } from './results.js';
 import { type EvidenceExportManifest } from './evidenceExport.js';
+/**
+ * D2.6 review fix #1: thrown by execute() whenever the operation's
+ * authoritative stored PREFLIGHT decision is not ALLOW (BLOCK,
+ * REQUIRE_APPROVAL, UNKNOWN, or — defensively — undeterminable). This is the
+ * generic, executor-independent enforcement point: no executor (PayBox,
+ * X402BaseUsdcExecutor, a custom one) is ever reachable from execute() for
+ * an operation that didn't authoritatively reach ALLOW.
+ */
+export declare class PreflightNotAllowedError extends Error {
+    constructor(operationId: string, status: string | null);
+}
 export declare class RecoveryRequiredError extends Error {
     constructor(operationId: string);
 }
@@ -89,6 +100,15 @@ export declare class CommerceOperation {
     /** @internal -- exposed for evidence export and tests. */
     currentRecord(): CommerceRecoveryRecord;
     private reload;
+    /**
+     * Fail-closed gate (D2.6 review fix #1): execute() calls this before ANY
+     * executor method is reachable. Prefers the locally cached
+     * `preflightDecisionStatus` (set the moment preflight() itself received an
+     * authoritative decision) — falls back to re-fetching the signed receipt
+     * itself for a record that predates this field, or whose cache write
+     * never landed, rather than ever assuming ALLOW.
+     */
+    private assertPreflightAllowed;
     private casUpdate;
     /**
      * Claims `clientSubmissionKey` for a fresh submission attempt -- but

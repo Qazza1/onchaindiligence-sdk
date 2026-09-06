@@ -10,7 +10,17 @@
  */
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { createCommerceClient, InMemoryRecoveryStore, PayBoxCommerceExecutor, InMemoryPayBoxRequestStore, PAYBOX_BASE_NETWORK, PAYBOX_BASE_USDC } from '../dist/commerce/index.js'
+import {
+  createCommerceClient,
+  InMemoryRecoveryStore,
+  PayBoxCommerceExecutor,
+  InMemoryPayBoxRequestStore,
+  PayBoxStoreRequiredError,
+  PayBoxAmbiguousPrepareError,
+  PreflightNotAllowedError,
+  PAYBOX_BASE_NETWORK,
+  PAYBOX_BASE_USDC,
+} from '../dist/commerce/index.js'
 import { createFakeServer } from './fakeServer.mjs'
 import { FakePayBoxClient } from './fakePayboxClient.mjs'
 
@@ -37,7 +47,7 @@ function merchantFetch(fakeTxHash) {
   }
 }
 
-test('test matrix #1: OCD BLOCK never invokes PayBox pay_x402', async () => {
+test('test matrix #1: OCD BLOCK never invokes PayBox pay_x402, enforced by CommerceOperation itself, not caller discipline', async () => {
   const server = createFakeServer()
   const client = createCommerceClient({ recovery: new InMemoryRecoveryStore(), fetch: server.fetch })
   const op = await client.open({ action: ACTION, policy: { ...POLICY, max_amount: '0.01' } }) // 1.00 > 0.01 -> BLOCK
@@ -45,22 +55,25 @@ test('test matrix #1: OCD BLOCK never invokes PayBox pay_x402', async () => {
   assert.equal(evaluation.kind, 'blocked')
 
   const paybox = new FakePayBoxClient()
-  // Mirrors commerceLifecycle.test.mjs's own BLOCK test: a correct
-  // integration checks evaluation.kind BEFORE ever calling execute() -- there
-  // is no code path here that reaches execute() for a blocked evaluation.
-  if (evaluation.kind === 'ready') {
-    await op.execute({ executor: new PayBoxCommerceExecutor({ paybox, credentialId: CREDENTIAL_ID, fetch: merchantFetch('0x' + '00'.repeat(32)) }) })
-  }
+  // D2.6 review fix #1: deliberately call execute() anyway, WITHOUT checking
+  // evaluation.kind first -- CommerceOperation's own fail-closed gate, not
+  // caller discipline, must be what stops PayBox from ever being reached.
+  const executor = new PayBoxCommerceExecutor({ paybox, credentialId: CREDENTIAL_ID, store: new InMemoryPayBoxRequestStore(), fetch: merchantFetch('0x' + '00'.repeat(32)) })
+  await assert.rejects(() => op.execute({ executor }), PreflightNotAllowedError)
   assert.equal(paybox.payX402Calls.length, 0, 'a BLOCKed evaluation must never lead to PayBox being called')
 })
 
-test('test matrix #2: OCD REQUIRE_APPROVAL does not bypass PayBox and is never auto-submitted', async () => {
+test('test matrix #2: OCD REQUIRE_APPROVAL does not bypass PayBox, enforced by CommerceOperation itself even if execute() is called anyway', async () => {
   const server = createFakeServer({ forceRequireApproval: true })
   const client = createCommerceClient({ recovery: new InMemoryRecoveryStore(), fetch: server.fetch })
   const op = await client.open({ action: ACTION, policy: POLICY })
   const evaluation = await op.preflight()
   assert.equal(evaluation.kind, 'approval-required')
-  // No execute() call follows -- approval-required is a stop sign.
+
+  const paybox = new FakePayBoxClient()
+  const executor = new PayBoxCommerceExecutor({ paybox, credentialId: CREDENTIAL_ID, store: new InMemoryPayBoxRequestStore(), fetch: merchantFetch('0x' + '01'.repeat(32)) })
+  await assert.rejects(() => op.execute({ executor }), PreflightNotAllowedError)
+  assert.equal(paybox.payX402Calls.length, 0, 'a REQUIRE_APPROVAL evaluation must never lead to PayBox being called')
 })
 
 test('test matrix #3: PayBox DENIED produces no merchant payment and no receipt', async () => {
@@ -80,7 +93,7 @@ test('test matrix #3: PayBox DENIED produces no merchant payment and no receipt'
     merchantCalls++
     return merchantFetch('0x' + 'ff'.repeat(32))(url, init)
   }
-  const executor = new PayBoxCommerceExecutor({ paybox, credentialId: CREDENTIAL_ID, fetch: fetchImpl })
+  const executor = new PayBoxCommerceExecutor({ paybox, credentialId: CREDENTIAL_ID, store: new InMemoryPayBoxRequestStore(), fetch: fetchImpl })
   const execution = await op.execute({ executor })
   assert.equal(execution.kind, 'manual-recovery-required')
   assert.match(execution.reason, /denied/)
@@ -104,7 +117,7 @@ test('test matrix #4/#5: a PENDING PayBox request is polled and resumed, never r
     c.requests.set(id, { request_id: id, status: 'pending_approval' })
     return { request_id: id, status: 'pending_approval' }
   }
-  const executor = new PayBoxCommerceExecutor({ paybox, credentialId: CREDENTIAL_ID, fetch: merchantFetch('0x' + 'aa'.repeat(32)) })
+  const executor = new PayBoxCommerceExecutor({ paybox, credentialId: CREDENTIAL_ID, store: new InMemoryPayBoxRequestStore(), fetch: merchantFetch('0x' + 'aa'.repeat(32)) })
 
   const first = await op.execute({ executor })
   assert.equal(first.kind, 'pending')
@@ -133,7 +146,7 @@ test('test matrix #7/#12: the PayBox request id is durably preserved and correla
   assert.equal((await op.preflight()).kind, 'ready')
 
   const paybox = new FakePayBoxClient()
-  const executor = new PayBoxCommerceExecutor({ paybox, credentialId: CREDENTIAL_ID, fetch: merchantFetch('0x' + 'bb'.repeat(32)) })
+  const executor = new PayBoxCommerceExecutor({ paybox, credentialId: CREDENTIAL_ID, store: new InMemoryPayBoxRequestStore(), fetch: merchantFetch('0x' + 'bb'.repeat(32)) })
   const execution = await op.execute({ executor })
   assert.equal(execution.kind, 'execution-recorded')
 
@@ -189,7 +202,7 @@ test('test matrix #13: no PayBox credential id enters the evidence export', asyn
   assert.equal((await op.preflight()).kind, 'ready')
 
   const paybox = new FakePayBoxClient()
-  const executor = new PayBoxCommerceExecutor({ paybox, credentialId: CREDENTIAL_ID, fetch: merchantFetch('0x' + 'dd'.repeat(32)) })
+  const executor = new PayBoxCommerceExecutor({ paybox, credentialId: CREDENTIAL_ID, store: new InMemoryPayBoxRequestStore(), fetch: merchantFetch('0x' + 'dd'.repeat(32)) })
   await op.execute({ executor })
   await op.observeAndFinalize()
 
@@ -197,25 +210,62 @@ test('test matrix #13: no PayBox credential id enters the evidence export', asyn
   assert.doesNotMatch(JSON.stringify(manifest), new RegExp(CREDENTIAL_ID))
 })
 
-test('test matrix #9: PayBox internal error and OCD settlement stay separate -- an error is retried as ambiguous, never surfaced as a settlement fact', async () => {
+test('test matrix #9: a terminal PayBox error stays a separate concept from OCD settlement -- terminal per docs.paybox.sh, never modeled as later resolving to success', async () => {
   const server = createFakeServer()
   const client = createCommerceClient({ recovery: new InMemoryRecoveryStore(), fetch: server.fetch })
   const op = await client.open({ action: ACTION, policy: POLICY })
   assert.equal((await op.preflight()).kind, 'ready')
 
+  let merchantCalls = 0
   const paybox = new FakePayBoxClient()
   paybox.onPayX402 = (input, c) => {
     const id = 'paybox-req-error'
     c.requests.set(id, { request_id: id, status: 'error', message: 'internal signer timeout' })
     return { request_id: id, status: 'error', message: 'internal signer timeout' }
   }
-  const executor = new PayBoxCommerceExecutor({ paybox, credentialId: CREDENTIAL_ID, fetch: merchantFetch('0x' + 'ee'.repeat(32)) })
+  const fetchImpl = async (url, init) => {
+    merchantCalls++
+    return merchantFetch('0x' + 'ee'.repeat(32))(url, init)
+  }
+  const executor = new PayBoxCommerceExecutor({ paybox, credentialId: CREDENTIAL_ID, store: new InMemoryPayBoxRequestStore(), fetch: fetchImpl })
   const execution = await op.execute({ executor })
-  assert.equal(execution.kind, 'pending', 'a PayBox-side error is ambiguous, not a definitive OCD execution failure')
-  assert.equal(execution.phase, 'execution-ambiguous')
+  // docs.paybox.sh/concepts/requests lists 'error' under "Terminal (polling
+  // stops)" -- this must be a definitive OCD outcome (manual-recovery-required),
+  // never the retryable 'pending'/execution-ambiguous state, and it must never
+  // be surfaced as if it were an OCD settlement fact (execution/settlement
+  // remain untouched -- no receipt exists at all).
+  assert.equal(execution.kind, 'manual-recovery-required')
+  assert.match(execution.reason, /terminal error/)
+  assert.equal(paybox.payX402Calls.length, 1)
 
-  paybox.requests.set('paybox-req-error', { request_id: 'paybox-req-error', status: 'success', output: { value: { x_payment: { header: 'X-PAYMENT', value: 'signed' } } } })
+  merchantCalls = 0 // reset after prepare()'s own read-only probe
+  assert.equal(merchantCalls, 0, 'a PayBox error must never reach the merchant')
+
+  // Retrying execute() again must not resubmit to PayBox, and must not
+  // "recover" into success -- a terminal error stays terminal.
   const retried = await op.execute({ executor })
-  assert.equal(retried.kind, 'execution-recorded')
+  assert.equal(retried.kind, 'manual-recovery-required')
+  assert.equal(paybox.payX402Calls.length, 1, 'a terminal PayBox error must never be retried into a new pay_x402 call')
+
+  const finalize = await op.observeAndFinalize()
+  assert.equal(finalize.kind, 'pending', 'no transaction hash exists -- OCD settlement must never be inferred from a PayBox-side error')
+})
+
+test('a terminal PayBox success with no readable x_payment output stops safely instead of polling forever', async () => {
+  const paybox = new FakePayBoxClient()
+  paybox.onPayX402 = (input, c) => {
+    const id = 'paybox-req-broken-output'
+    c.requests.set(id, { request_id: id, status: 'success', output: {} })
+    return { request_id: id, status: 'success', output: {} }
+  }
+  const executor = new PayBoxCommerceExecutor({ paybox, credentialId: CREDENTIAL_ID, store: new InMemoryPayBoxRequestStore(), fetch: merchantFetch('0x' + '44'.repeat(32)) })
+  const prepared = await executor.prepare({ clientSubmissionKey: 'attempt-1', action: ACTION })
+  const outcome = await executor.submit(prepared)
+  assert.equal(outcome.status, 'manual-recovery-required')
+  assert.match(outcome.reason, /terminal status "success"/)
+
+  const generic = { clientSubmissionKey: 'attempt-1', reference: { action: ACTION }, preparedAt: prepared.preparedAt }
+  const resumed = await executor.resume(generic)
+  assert.equal(resumed.status, 'manual-recovery-required', 'polling the same broken terminal response again must not become retryable-forever')
   assert.equal(paybox.payX402Calls.length, 1)
 })

@@ -11,7 +11,7 @@
  */
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { createCommerceClient, InMemoryRecoveryStore, MockCommerceExecutor } from '../dist/commerce/index.js'
+import { createCommerceClient, InMemoryRecoveryStore, MockCommerceExecutor, PreflightNotAllowedError } from '../dist/commerce/index.js'
 import { createFakeServer } from './fakeServer.mjs'
 
 const ACTION = {
@@ -84,6 +84,67 @@ test('REQUIRE_APPROVAL does not auto-submit', async () => {
   // No execute() call follows -- approval-required is a stop sign, not a
   // "keep going" state. There is no code path in this SDK that silently
   // promotes approval-required into a submission.
+})
+
+test('D2.6 review fix #1: execute() fails closed with PreflightNotAllowedError for a BLOCK decision, even if the caller ignores evaluation.kind and calls it anyway', async () => {
+  const server = createFakeServer()
+  const client = createCommerceClient({ recovery: new InMemoryRecoveryStore(), fetch: server.fetch })
+  const op = await client.open({ action: ACTION, policy: { ...POLICY, max_amount: '0.01' } }) // 1.00 > 0.01 -> BLOCK
+  const evaluation = await op.preflight()
+  assert.equal(evaluation.kind, 'blocked')
+
+  let prepareCalled = false
+  class WatchedExecutor extends MockCommerceExecutor {
+    async prepare(ctx) {
+      prepareCalled = true
+      return super.prepare(ctx)
+    }
+  }
+  // Deliberately ignore evaluation.kind -- CommerceOperation itself, not
+  // caller discipline, must be what stops this.
+  await assert.rejects(() => op.execute({ executor: new WatchedExecutor() }), PreflightNotAllowedError)
+  assert.equal(prepareCalled, false, 'a BLOCKed operation must never reach executor.prepare(), regardless of what the caller checked')
+})
+
+test('D2.6 review fix #1: execute() fails closed with PreflightNotAllowedError for a REQUIRE_APPROVAL decision, even if the caller ignores evaluation.kind and calls it anyway', async () => {
+  const server = createFakeServer({ forceRequireApproval: true })
+  const client = createCommerceClient({ recovery: new InMemoryRecoveryStore(), fetch: server.fetch })
+  const op = await client.open({ action: ACTION, policy: POLICY })
+  const evaluation = await op.preflight()
+  assert.equal(evaluation.kind, 'approval-required')
+
+  let prepareCalled = false
+  class WatchedExecutor extends MockCommerceExecutor {
+    async prepare(ctx) {
+      prepareCalled = true
+      return super.prepare(ctx)
+    }
+  }
+  await assert.rejects(() => op.execute({ executor: new WatchedExecutor() }), PreflightNotAllowedError)
+  assert.equal(prepareCalled, false, 'a REQUIRE_APPROVAL operation must never reach executor.prepare(), regardless of what the caller checked')
+})
+
+test('D2.6 review fix #1: the fail-closed gate is authoritative, not merely a preflightReceiptId presence check -- a resumed operation with no cached decision re-fetches the receipt rather than assuming ALLOW', async () => {
+  const server = createFakeServer()
+  const store = new InMemoryRecoveryStore()
+  const client = createCommerceClient({ recovery: store, fetch: server.fetch })
+  const op = await client.open({ action: ACTION, policy: { ...POLICY, max_amount: '0.01' } }) // BLOCK
+  await op.preflight()
+
+  // Simulate a record from before preflightDecisionStatus existed: strip it
+  // back out after the real preflight() call already set it.
+  const record = await store.load(op.operationId)
+  await store.update(op.operationId, { preflightDecisionStatus: null }, record.version)
+
+  let prepareCalled = false
+  class WatchedExecutor extends MockCommerceExecutor {
+    async prepare(ctx) {
+      prepareCalled = true
+      return super.prepare(ctx)
+    }
+  }
+  await assert.rejects(() => op.execute({ executor: new WatchedExecutor() }), PreflightNotAllowedError)
+  assert.equal(prepareCalled, false, 'a missing cached decision must re-fetch the authoritative receipt, never assume ALLOW')
 })
 
 test('executor prepare() occurs before submit() and persists identity first', async () => {

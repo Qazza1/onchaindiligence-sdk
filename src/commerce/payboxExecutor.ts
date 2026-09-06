@@ -134,6 +134,26 @@ export interface PayBoxRequestRecord {
 export interface PayBoxRequestStore {
   get(clientSubmissionKey: string): Promise<PayBoxRequestRecord | null>
   set(record: PayBoxRequestRecord): Promise<void>
+  /**
+   * Atomically claims the attempt slot for `clientSubmissionKey` (D2.6
+   * review fix #3): if no record exists yet, stores `placeholder` (which
+   * MUST have `payboxRequestId: null`) and returns `{ claimed: true, record:
+   * placeholder }` -- the caller, and ONLY the caller, may now call
+   * `pay_x402` for this key. If a record already exists (whether still in
+   * the ambiguous pre-request-id window, or already holding a
+   * `payboxRequestId`), returns `{ claimed: false, record: <the existing
+   * record, unmodified> }` and the caller MUST NOT call `pay_x402`.
+   *
+   * This is the ONE operation in this interface that a real, multi-process
+   * implementation MUST make genuinely atomic (e.g. a SQL `INSERT ... ON
+   * CONFLICT DO NOTHING` followed by a `SELECT`, or an equivalent
+   * conditional-put) -- the same discipline as `CommerceRecoveryStore.create()`
+   * throwing `RecoveryRecordExistsError` rather than silently overwriting.
+   * `InMemoryPayBoxRequestStore`'s implementation is atomic only because a
+   * single JS `Map` access with no `await` in between can never interleave
+   * with another call in the same process.
+   */
+  claim(clientSubmissionKey: string, placeholder: PayBoxRequestRecord): Promise<{ claimed: boolean; record: PayBoxRequestRecord }>
 }
 
 /** Volatile, single-process, TEST/EXAMPLE-ONLY implementation -- same discipline as recoveryStore.ts's InMemoryRecoveryStore. Does not survive a restart; a real deployment must implement this against durable storage. */
@@ -144,6 +164,25 @@ export class InMemoryPayBoxRequestStore implements PayBoxRequestStore {
   }
   async set(record: PayBoxRequestRecord): Promise<void> {
     this.records.set(record.clientSubmissionKey, { ...record })
+  }
+  async claim(clientSubmissionKey: string, placeholder: PayBoxRequestRecord): Promise<{ claimed: boolean; record: PayBoxRequestRecord }> {
+    // No `await` between the check and the write -- this is what makes this
+    // specific implementation race-free for concurrent callers IN THIS PROCESS.
+    const existing = this.records.get(clientSubmissionKey)
+    if (existing) return { claimed: false, record: { ...existing } }
+    const stored = { ...placeholder }
+    this.records.set(clientSubmissionKey, stored)
+    return { claimed: true, record: { ...stored } }
+  }
+}
+
+/** Thrown by the PayBoxCommerceExecutor constructor when no durable store was supplied (D2.6 review fix #2). */
+export class PayBoxStoreRequiredError extends Error {
+  constructor() {
+    super(
+      "PayBoxCommerceExecutor requires an explicit, durable `store` (PayBoxRequestStore) -- InMemoryPayBoxRequestStore is test/example-only and does not survive a restart, which would silently make this executor's advertised recoveryMode ('stable-payment-identity') false. Pass a durable implementation in production; InMemoryPayBoxRequestStore only in tests/examples."
+    )
+    this.name = 'PayBoxStoreRequiredError'
   }
 }
 
@@ -162,8 +201,17 @@ export interface PayBoxExecutorOptions {
   paybox: PayBoxClient
   /** The single PayBox wallet-kind credential this executor pays from (Section 2: one credential, one operation at a time for the reference flow). */
   credentialId: string
-  /** Durable store for this adapter's own request identity. Defaults to an in-memory store -- REQUIRED to be durable (e.g. backed by the same storage as your CommerceRecoveryStore) for real crash/restart recovery, exactly like recoveryStore.ts's own default. */
-  store?: PayBoxRequestStore
+  /**
+   * Durable store for this adapter's own request identity -- REQUIRED, no
+   * default (D2.6 review fix #2). This class advertises
+   * `recoveryMode: 'stable-payment-identity'`, which is only true if the
+   * PayBox request_id genuinely survives a restart; silently defaulting to
+   * `InMemoryPayBoxRequestStore` would make that claim false the moment the
+   * process restarts. `InMemoryPayBoxRequestStore` remains available for
+   * tests/examples but must be passed explicitly, exactly like
+   * `CommerceRecoveryStore` has no safe default either.
+   */
+  store: PayBoxRequestStore
   fetch?: typeof globalThis.fetch
   /** Base RPC used ONLY for read-only resume confirmation of an already-known transaction hash. Defaults to the public Base RPC. */
   rpcUrl?: string
@@ -193,9 +241,10 @@ export class PayBoxCommerceExecutor implements CommerceExecutor {
   private readonly injectedPublicClient?: MinimalResumeClient
 
   constructor(options: PayBoxExecutorOptions) {
+    if (!options.store) throw new PayBoxStoreRequiredError()
     this.paybox = options.paybox
     this.credentialId = options.credentialId
-    this.store = options.store ?? new InMemoryPayBoxRequestStore()
+    this.store = options.store
     // See client.ts's constructor comment: binding here is what keeps a bare
     // `globalThis.fetch` reference safe to call as `this.fetchImpl(...)` in
     // a real browser.
@@ -211,32 +260,24 @@ export class PayBoxCommerceExecutor implements CommerceExecutor {
     }
     if (!context.action.resource) throw new X402ChallengeError('action.resource (the x402 resource URL) is required to prepare a submission')
 
-    const existing = await this.store.get(context.clientSubmissionKey)
-    if (existing?.payboxRequestId) {
-      // A PayBox request already exists for this exact submission attempt --
-      // never call pay_x402 again for it (idempotent re-entry, e.g. a
-      // developer calling prepare() directly outside the orchestrator, or a
-      // retried execute() that reaches prepare() again before a binding is
-      // registered).
-      return this.toPrepareResult(context.clientSubmissionKey, existing)
-    }
-    if (existing && !existing.payboxRequestId) {
-      throw new PayBoxAmbiguousPrepareError(context.clientSubmissionKey)
-    }
-
     // Read-only probe -- no PayBox call, no signing, no payment. Establishes
     // exactly what would be agreed to pay BEFORE any authorization exists,
-    // identical in spirit to X402BaseUsdcExecutor.prepare().
+    // identical in spirit to X402BaseUsdcExecutor.prepare(). Safe to run
+    // more than once even under a concurrent race (it has no side effects),
+    // so it happens BEFORE the atomic claim below.
     const probe = await this.fetchImpl(context.action.resource)
     if (probe.status !== 402) throw new X402ChallengeError(`expected HTTP 402 from ${context.action.resource}, got ${probe.status}`)
     const challenge = decodeChallenge(probe)
     const atomicAmount = decimalToAtomic6(context.action.amount)
     validateChallenge(challenge, { network: context.action.network, asset: context.action.asset, amount: atomicAmount, recipient: context.action.recipient })
 
-    // Record the attempt BEFORE calling PayBox -- a crash between "we asked"
-    // and "we learned the request_id" is then visible as the ambiguous case
-    // above on the next prepare() call, instead of silently vanishing.
-    await this.store.set({
+    // D2.6 review fix #3: atomically claim the attempt slot for this
+    // clientSubmissionKey -- exactly one concurrent caller may proceed to
+    // call pay_x402. A loser either reuses the winner's already-established
+    // request (if it finished first) or, if the winner is still in the
+    // ambiguous pre-request-id window, stops safely rather than racing to
+    // call pay_x402 itself.
+    const placeholder: PayBoxRequestRecord = {
       clientSubmissionKey: context.clientSubmissionKey,
       payboxRequestId: null,
       resourceUrl: context.action.resource,
@@ -245,9 +286,23 @@ export class PayBoxCommerceExecutor implements CommerceExecutor {
       atomicAmount,
       recipient: context.action.recipient,
       transactionHash: null,
-    })
+    }
+    const { claimed, record: claimedRecord } = await this.store.claim(context.clientSubmissionKey, placeholder)
+    if (!claimed) {
+      if (claimedRecord.payboxRequestId) {
+        // Another attempt already established (or is finishing establishing)
+        // a PayBox request for this exact key -- never call pay_x402 again.
+        return this.toPrepareResult(context.clientSubmissionKey, claimedRecord)
+      }
+      // The winner called pay_x402 but this process never learned the
+      // outcome (crash, or the winner is still in flight). Known,
+      // unavoidable crash window (see this file's header) -- surface it
+      // honestly rather than racing to call pay_x402 ourselves.
+      throw new PayBoxAmbiguousPrepareError(context.clientSubmissionKey)
+    }
 
-    // This is PayBox's OWN independent grant/authorization check -- pay_x402
+    // We won the claim -- exactly this call may proceed to PayBox. This is
+    // PayBox's OWN independent grant/authorization check -- pay_x402
     // internally applies the credential's approval mode ("Always Ask" vs
     // autonomous-within-limits per docs.paybox.sh/concepts/model) before
     // ever producing a signature. Does NOT broadcast anything on-chain (see
@@ -259,16 +314,7 @@ export class PayBoxCommerceExecutor implements CommerceExecutor {
       x402_version: (challenge as { x402Version?: 1 | 2 }).x402Version,
     })
 
-    const record: PayBoxRequestRecord = {
-      clientSubmissionKey: context.clientSubmissionKey,
-      payboxRequestId: envelope.request_id,
-      resourceUrl: context.action.resource,
-      network: context.action.network,
-      asset: context.action.asset,
-      atomicAmount,
-      recipient: context.action.recipient,
-      transactionHash: null,
-    }
+    const record: PayBoxRequestRecord = { ...claimedRecord, payboxRequestId: envelope.request_id }
     await this.store.set(record)
     return this.toPrepareResult(context.clientSubmissionKey, record)
   }
@@ -387,11 +433,18 @@ export class PayBoxCommerceExecutor implements CommerceExecutor {
       }
     }
     if (envelope.status === 'error') {
+      // D2.6 review fix #4: docs.paybox.sh/concepts/requests lists `error`
+      // under "Terminal (polling stops)" -- treating it as retryable
+      // submission-ambiguous would poll the SAME terminal envelope forever
+      // and, worse, invites a caller to eventually give up and start a NEW
+      // PayBox request for the same intent. Terminal and definitive, exactly
+      // like `denied`: no merchant payment occurred and this request will
+      // never resolve differently. A genuinely NEW attempt requires a NEW
+      // operation/clientSubmissionKey, never a retry of this one.
       return {
         clientSubmissionKey,
-        status: 'submission-ambiguous',
-        reason: `PayBox reported an internal error for request ${ref.payboxRequestId}${envelope.message ? `: ${envelope.message}` : ''}`,
-        retryAfterSeconds: 10,
+        status: 'manual-recovery-required',
+        reason: `PayBox reported a terminal error for request ${ref.payboxRequestId}${envelope.message ? `: ${envelope.message}` : ''} -- no merchant payment was made; this request will not resolve differently on retry`,
       }
     }
 
@@ -400,7 +453,14 @@ export class PayBoxCommerceExecutor implements CommerceExecutor {
     // X402BaseUsdcExecutor.submit()'s own post-signing half.
     const xPayment = envelope.output?.value?.x_payment
     if (!xPayment?.header || !xPayment?.value) {
-      return { clientSubmissionKey, status: 'submission-ambiguous', reason: `PayBox request ${ref.payboxRequestId} succeeded but no x_payment header could be read from its output` }
+      // `success` is ALSO terminal (per docs) -- polling get_request again
+      // would return this exact same envelope forever, so this must stop
+      // safely rather than being reported as retryable.
+      return {
+        clientSubmissionKey,
+        status: 'manual-recovery-required',
+        reason: `PayBox request ${ref.payboxRequestId} reached terminal status "success" but no x_payment header could be read from its output -- check PayBox directly before retrying`,
+      }
     }
     return this.presentPaymentToMerchant(clientSubmissionKey, ref, xPayment)
   }

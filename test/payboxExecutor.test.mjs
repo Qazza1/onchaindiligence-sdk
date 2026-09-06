@@ -14,6 +14,7 @@ import {
   PayBoxCommerceExecutor,
   InMemoryPayBoxRequestStore,
   PayBoxAmbiguousPrepareError,
+  PayBoxStoreRequiredError,
   PAYBOX_BASE_NETWORK,
   PAYBOX_BASE_USDC,
 } from '../dist/commerce/index.js'
@@ -48,8 +49,44 @@ function merchantFetchAcceptingHeader(fakeTxHash) {
 }
 
 test('recoveryMode is honestly stable-payment-identity, not provider-idempotent or manual', () => {
-  const executor = new PayBoxCommerceExecutor({ paybox: new FakePayBoxClient(), credentialId: CREDENTIAL_ID })
+  const executor = new PayBoxCommerceExecutor({ paybox: new FakePayBoxClient(), credentialId: CREDENTIAL_ID, store: new InMemoryPayBoxRequestStore() })
   assert.equal(executor.recoveryMode, 'stable-payment-identity')
+})
+
+test('D2.6 review fix #2: constructing without a durable store fails fast, never silently defaults to volatile storage', () => {
+  assert.throws(() => new PayBoxCommerceExecutor({ paybox: new FakePayBoxClient(), credentialId: CREDENTIAL_ID }), PayBoxStoreRequiredError)
+  assert.throws(() => new PayBoxCommerceExecutor({ paybox: new FakePayBoxClient(), credentialId: CREDENTIAL_ID, store: undefined }), PayBoxStoreRequiredError)
+})
+
+test('D2.6 review fix #3: concurrent prepare() calls for the same clientSubmissionKey call pay_x402 exactly once', async () => {
+  const store = new InMemoryPayBoxRequestStore()
+  const paybox = new FakePayBoxClient()
+  const executor = new PayBoxCommerceExecutor({ paybox, credentialId: CREDENTIAL_ID, store, fetch: merchantFetchAcceptingHeader('0x' + '33'.repeat(32)) })
+
+  const [a, b] = await Promise.allSettled([
+    executor.prepare({ clientSubmissionKey: 'race-1', action: ACTION }),
+    executor.prepare({ clientSubmissionKey: 'race-1', action: ACTION }),
+  ])
+  assert.equal(paybox.payX402Calls.length, 1, 'exactly one PayBox request must be created for two concurrent attempts')
+
+  // Exactly one claimant proceeds and always succeeds; the other either
+  // reuses the SAME established request (if the winner finished first) or is
+  // honestly rejected as ambiguous (the known, unavoidable crash-window case
+  // -- see PayBoxAmbiguousPrepareError) -- it must never independently call
+  // pay_x402 itself.
+  const outcomes = [a, b]
+  const fulfilled = outcomes.filter((o) => o.status === 'fulfilled')
+  assert.ok(fulfilled.length >= 1, 'the winning claimant must always succeed')
+  for (const o of fulfilled) assert.ok(o.value.providerReference.startsWith('paybox:'))
+  for (const o of outcomes) {
+    if (o.status === 'rejected') assert.ok(o.reason instanceof PayBoxAmbiguousPrepareError)
+  }
+
+  // Once the race has settled, a follow-up prepare() for the SAME key must
+  // reuse the established request -- never call pay_x402 again.
+  const followUp = await executor.prepare({ clientSubmissionKey: 'race-1', action: ACTION })
+  assert.equal(paybox.payX402Calls.length, 1)
+  assert.ok(followUp.providerReference.startsWith('paybox:'))
 })
 
 test('prepare() probes the merchant read-only, calls pay_x402 exactly once, and never broadcasts', async () => {
@@ -59,7 +96,7 @@ test('prepare() probes the merchant read-only, calls pay_x402 exactly once, and 
     return new Response(null, { status: 402, headers: { 'payment-required': base64utf8(validChallenge()) } })
   }
   const paybox = new FakePayBoxClient()
-  const executor = new PayBoxCommerceExecutor({ paybox, credentialId: CREDENTIAL_ID, fetch: fakeFetch })
+  const executor = new PayBoxCommerceExecutor({ paybox, credentialId: CREDENTIAL_ID, store: new InMemoryPayBoxRequestStore(), fetch: fakeFetch })
   const prepared = await executor.prepare({ clientSubmissionKey: 'attempt-1', action: ACTION })
 
   assert.equal(fetchCalls, 1, 'prepare() must make exactly one read-only merchant probe')
@@ -72,7 +109,7 @@ test('prepare() probes the merchant read-only, calls pay_x402 exactly once, and 
 test('prepare() rejects a challenge quoting the wrong recipient before ever calling PayBox', async () => {
   const fakeFetch = async () => new Response(null, { status: 402, headers: { 'payment-required': base64utf8(validChallenge({ payTo: '0x1111111111111111111111111111111111111a' })) } })
   const paybox = new FakePayBoxClient()
-  const executor = new PayBoxCommerceExecutor({ paybox, credentialId: CREDENTIAL_ID, fetch: fakeFetch })
+  const executor = new PayBoxCommerceExecutor({ paybox, credentialId: CREDENTIAL_ID, store: new InMemoryPayBoxRequestStore(), fetch: fakeFetch })
   await assert.rejects(() => executor.prepare({ clientSubmissionKey: 'attempt-1', action: ACTION }), /recipient mismatch/)
   assert.equal(paybox.payX402Calls.length, 0, 'PayBox must never be called when the challenge itself is rejected')
 })
@@ -80,7 +117,7 @@ test('prepare() rejects a challenge quoting the wrong recipient before ever call
 test('submit() presents the PayBox-signed header to the merchant and extracts the transaction hash', async () => {
   const fakeTxHash = '0x' + 'ab'.repeat(32)
   const paybox = new FakePayBoxClient()
-  const executor = new PayBoxCommerceExecutor({ paybox, credentialId: CREDENTIAL_ID, fetch: merchantFetchAcceptingHeader(fakeTxHash) })
+  const executor = new PayBoxCommerceExecutor({ paybox, credentialId: CREDENTIAL_ID, store: new InMemoryPayBoxRequestStore(), fetch: merchantFetchAcceptingHeader(fakeTxHash) })
   const prepared = await executor.prepare({ clientSubmissionKey: 'attempt-1', action: ACTION })
   const outcome = await executor.submit(prepared)
   assert.equal(outcome.status, 'transaction-known')
@@ -95,7 +132,7 @@ test('a PENDING PayBox request is polled via get_request, never resubmitted via 
     client.requests.set(id, { request_id: id, status: 'pending_approval' })
     return { request_id: id, status: 'pending_approval' }
   }
-  const executor = new PayBoxCommerceExecutor({ paybox, credentialId: CREDENTIAL_ID, fetch: merchantFetchAcceptingHeader('0x' + 'cd'.repeat(32)) })
+  const executor = new PayBoxCommerceExecutor({ paybox, credentialId: CREDENTIAL_ID, store: new InMemoryPayBoxRequestStore(), fetch: merchantFetchAcceptingHeader('0x' + 'cd'.repeat(32)) })
   const prepared = await executor.prepare({ clientSubmissionKey: 'attempt-1', action: ACTION })
 
   const first = await executor.submit(prepared)
@@ -130,7 +167,7 @@ test('PayBox DENIED never presents anything to the merchant and is terminal, not
     merchantCalls++
     return new Response(null, { status: 402, headers: { 'payment-required': base64utf8(validChallenge()) } })
   }
-  const executor = new PayBoxCommerceExecutor({ paybox, credentialId: CREDENTIAL_ID, fetch: fakeFetch })
+  const executor = new PayBoxCommerceExecutor({ paybox, credentialId: CREDENTIAL_ID, store: new InMemoryPayBoxRequestStore(), fetch: fakeFetch })
   const prepared = await executor.prepare({ clientSubmissionKey: 'attempt-1', action: ACTION })
   merchantCalls = 0 // reset after prepare()'s own probe
 
@@ -185,7 +222,7 @@ test('resume() with an already-confirmed prior transaction hash re-confirms on-c
     return new Response(null, { status: 402, headers: { 'payment-required': base64utf8(validChallenge()) } })
   }
   const fakePublicClient = { getTransactionReceipt: async ({ hash }) => (hash === knownTxHash ? { status: 'success' } : Promise.reject(new Error('not found'))) }
-  const executor = new PayBoxCommerceExecutor({ paybox, credentialId: CREDENTIAL_ID, fetch: fakeFetch, publicClient: fakePublicClient })
+  const executor = new PayBoxCommerceExecutor({ paybox, credentialId: CREDENTIAL_ID, store: new InMemoryPayBoxRequestStore(), fetch: fakeFetch, publicClient: fakePublicClient })
   const prepared = await executor.prepare({ clientSubmissionKey: 'attempt-1', action: ACTION })
   merchantCalls = 0
 
@@ -198,14 +235,14 @@ test('resume() with an already-confirmed prior transaction hash re-confirms on-c
 
 test('resume() with no PayBox request on record honestly reports manual-recovery-required', async () => {
   const paybox = new FakePayBoxClient()
-  const executor = new PayBoxCommerceExecutor({ paybox, credentialId: CREDENTIAL_ID })
+  const executor = new PayBoxCommerceExecutor({ paybox, credentialId: CREDENTIAL_ID, store: new InMemoryPayBoxRequestStore() })
   const resumed = await executor.resume({ clientSubmissionKey: 'never-prepared', reference: { action: ACTION }, preparedAt: new Date().toISOString() })
   assert.equal(resumed.status, 'manual-recovery-required')
 })
 
 test('no PayBox credential id leaks into prepare()/submit() outcomes', async () => {
   const paybox = new FakePayBoxClient()
-  const executor = new PayBoxCommerceExecutor({ paybox, credentialId: CREDENTIAL_ID, fetch: merchantFetchAcceptingHeader('0x' + '22'.repeat(32)) })
+  const executor = new PayBoxCommerceExecutor({ paybox, credentialId: CREDENTIAL_ID, store: new InMemoryPayBoxRequestStore(), fetch: merchantFetchAcceptingHeader('0x' + '22'.repeat(32)) })
   const prepared = await executor.prepare({ clientSubmissionKey: 'attempt-1', action: ACTION })
   const outcome = await executor.submit(prepared)
   assert.doesNotMatch(JSON.stringify(prepared), new RegExp(CREDENTIAL_ID))
