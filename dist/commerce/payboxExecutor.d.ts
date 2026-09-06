@@ -113,6 +113,18 @@ export interface PayBoxRequestRecord {
     expectedPayer?: string | null;
     /** gateway mode only: the Base block number captured (read-only, BEFORE calling useService) as the lower bound of the on-chain transfer search window -- stored as a decimal string (JSON has no bigint). Fixed once so repeated resume() calls never miss a transfer that took a while to confirm. */
     searchFromBlock?: string | null;
+    /**
+     * gateway mode only (D2.6 correction): the FROZEN upper bound of the
+     * search window -- `searchFromBlock + GATEWAY_SEARCH_WINDOW_BLOCKS`,
+     * computed and persisted once, at the same moment as `searchFromBlock`.
+     * Without this, discoverTransaction() searching "searchFromBlock ->
+     * current chain head" on every resume would let the candidate window
+     * expand indefinitely, so an unrelated FUTURE transfer between the same
+     * two addresses for the same amount could eventually become the single
+     * exact match for an old request. A restart/resume MUST use this exact
+     * same value, never recompute a fresh one.
+     */
+    searchToBlock?: string | null;
     /** Non-secret provider metadata (D2.6 requirement 3) -- never anything sensitive (no signatures, no authorization payloads). */
     outputId?: string | null;
     auditId?: string | null;
@@ -199,7 +211,20 @@ export interface PayBoxExecutorOptions {
 }
 export declare class PayBoxCommerceExecutor implements CommerceExecutor {
     readonly id = "paybox-x402-base-usdc";
-    readonly version = "v1";
+    /**
+     * D2.6 correction: gateway mode reports a DIFFERENT version string
+     * ('v1-gateway') than header mode ('v1') -- this is the explicit,
+     * already-durable signal (recorded on the execution binding as
+     * `executor_version`, unchanged plumbing) that the server-side binding-
+     * strength derivation uses to cap gateway-recovered transactions at
+     * TRANSFER_MATCH_ONLY (see onchaindiligence-mcp's commerceLifecycle.ts,
+     * isConservativeMatchOnlyEvidence()). Gateway mode's transaction is
+     * recovered via a conservative exact-field-match search with no direct
+     * request_id -> transaction_hash relationship PayBox exposes -- header
+     * mode presents the actual signed authorization to the merchant itself,
+     * which IS direct evidence, so its version is unchanged.
+     */
+    readonly version: string;
     readonly recoveryMode: ExecutorRecoveryMode;
     private readonly paybox;
     private readonly credentialId;
@@ -264,10 +289,23 @@ export declare class PayBoxCommerceExecutor implements CommerceExecutor {
      * Conservative transaction-identity recovery (requirement 4): PayBox's
      * gateway result carries no transaction hash, so this searches Base USDC
      * `Transfer` logs for the ONE exact match to the frozen preflight identity
-     * (payer, recipient, amount) in a window anchored at `record.searchFromBlock`
-     * (captured read-only, before useService was ever called) through the
-     * current chain head. Balance delta alone is NEVER treated as transaction
-     * identity -- only an exact, uniquely-matching event.
+     * (payer, recipient, amount) in a window BOTH of whose bounds are frozen
+     * at prepare() time (`record.searchFromBlock`/`searchToBlock`, see their
+     * own doc comments) -- NEVER "searchFromBlock -> current chain head",
+     * which would let the candidate window expand indefinitely on every
+     * resume (D2.6 correction). Balance delta alone is NEVER treated as
+     * transaction identity -- only an exact, uniquely-matching event within
+     * this frozen window.
+     *
+     * Outcomes:
+     *   - exactly one exact match within the window -> transaction-known
+     *   - zero matches, window still open (chain head < searchToBlock)
+     *     -> submission-ambiguous (retryable -- may still be settling)
+     *   - zero matches, window exhausted (chain head >= searchToBlock)
+     *     -> manual-recovery-required (terminal -- this request will not
+     *     resolve differently on further retry)
+     *   - more than one exact match -> manual-recovery-required (never guessed)
+     *   - a match outside the frozen window is never even queried, let alone matched
      *
      * This is ONLY for identifying the candidate payment transaction to hand
      * to OCD. It does not replace, weaken, or bypass OCD's own independent

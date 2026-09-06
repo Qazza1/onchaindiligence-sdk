@@ -132,6 +132,17 @@ import { BASE_NETWORK, BASE_USDC } from './x402Executor.js';
 import { X402ChallengeError, decodeChallenge, validateChallenge, decodeSettlementResponse, decimalToAtomic6 } from './x402Challenge.js';
 export { BASE_NETWORK as PAYBOX_BASE_NETWORK, BASE_USDC as PAYBOX_BASE_USDC };
 const USDC_TRANSFER_EVENT = parseAbiItem('event Transfer(address indexed from, address indexed to, uint256 value)');
+/**
+ * D2.6 correction: the FIXED size (in blocks) of the gateway-mode
+ * transaction-search window, frozen at prepare() time as
+ * `searchFromBlock + GATEWAY_SEARCH_WINDOW_BLOCKS` -- never recomputed on
+ * resume, and never allowed to expand past this bound. ~1 hour at Base's
+ * ~2s block time: generous enough for approval delay + PayBox processing +
+ * on-chain confirmation lag, small enough that an unrelated future transfer
+ * between the same two addresses for the same amount cannot eventually
+ * become a false match for an old, abandoned request.
+ */
+const GATEWAY_SEARCH_WINDOW_BLOCKS = 1800n;
 /** Volatile, single-process, TEST/EXAMPLE-ONLY implementation -- same discipline as recoveryStore.ts's InMemoryRecoveryStore. Does not survive a restart; a real deployment must implement this against durable storage. */
 export class InMemoryPayBoxRequestStore {
     records = new Map();
@@ -168,7 +179,20 @@ export class PayBoxAmbiguousPrepareError extends Error {
 }
 export class PayBoxCommerceExecutor {
     id = 'paybox-x402-base-usdc';
-    version = 'v1';
+    /**
+     * D2.6 correction: gateway mode reports a DIFFERENT version string
+     * ('v1-gateway') than header mode ('v1') -- this is the explicit,
+     * already-durable signal (recorded on the execution binding as
+     * `executor_version`, unchanged plumbing) that the server-side binding-
+     * strength derivation uses to cap gateway-recovered transactions at
+     * TRANSFER_MATCH_ONLY (see onchaindiligence-mcp's commerceLifecycle.ts,
+     * isConservativeMatchOnlyEvidence()). Gateway mode's transaction is
+     * recovered via a conservative exact-field-match search with no direct
+     * request_id -> transaction_hash relationship PayBox exposes -- header
+     * mode presents the actual signed authorization to the merchant itself,
+     * which IS direct evidence, so its version is unchanged.
+     */
+    version;
     recoveryMode = 'stable-payment-identity';
     paybox;
     credentialId;
@@ -185,6 +209,7 @@ export class PayBoxCommerceExecutor {
         this.credentialId = options.credentialId;
         this.store = options.store;
         this.mode = options.mode ?? 'header';
+        this.version = this.mode === 'gateway' ? 'v1-gateway' : 'v1';
         // See client.ts's constructor comment: binding here is what keeps a bare
         // `globalThis.fetch` reference safe to call as `this.fetchImpl(...)` in
         // a real browser.
@@ -259,6 +284,9 @@ export class PayBoxCommerceExecutor {
             mode: this.mode,
             expectedPayer: context.action.sender ?? null,
             searchFromBlock: searchFromBlock !== null ? searchFromBlock.toString() : null,
+            // D2.6 correction: frozen NOW, alongside searchFromBlock -- never
+            // recomputed on resume, so the window can never expand indefinitely.
+            searchToBlock: searchFromBlock !== null ? (searchFromBlock + GATEWAY_SEARCH_WINDOW_BLOCKS).toString() : null,
         };
         const { claimed, record: claimedRecord } = await this.store.claim(context.clientSubmissionKey, placeholder);
         if (!claimed) {
@@ -544,10 +572,23 @@ export class PayBoxCommerceExecutor {
      * Conservative transaction-identity recovery (requirement 4): PayBox's
      * gateway result carries no transaction hash, so this searches Base USDC
      * `Transfer` logs for the ONE exact match to the frozen preflight identity
-     * (payer, recipient, amount) in a window anchored at `record.searchFromBlock`
-     * (captured read-only, before useService was ever called) through the
-     * current chain head. Balance delta alone is NEVER treated as transaction
-     * identity -- only an exact, uniquely-matching event.
+     * (payer, recipient, amount) in a window BOTH of whose bounds are frozen
+     * at prepare() time (`record.searchFromBlock`/`searchToBlock`, see their
+     * own doc comments) -- NEVER "searchFromBlock -> current chain head",
+     * which would let the candidate window expand indefinitely on every
+     * resume (D2.6 correction). Balance delta alone is NEVER treated as
+     * transaction identity -- only an exact, uniquely-matching event within
+     * this frozen window.
+     *
+     * Outcomes:
+     *   - exactly one exact match within the window -> transaction-known
+     *   - zero matches, window still open (chain head < searchToBlock)
+     *     -> submission-ambiguous (retryable -- may still be settling)
+     *   - zero matches, window exhausted (chain head >= searchToBlock)
+     *     -> manual-recovery-required (terminal -- this request will not
+     *     resolve differently on further retry)
+     *   - more than one exact match -> manual-recovery-required (never guessed)
+     *   - a match outside the frozen window is never even queried, let alone matched
      *
      * This is ONLY for identifying the candidate payment transaction to hand
      * to OCD. It does not replace, weaken, or bypass OCD's own independent
@@ -565,15 +606,27 @@ export class PayBoxCommerceExecutor {
                 reason: `PayBox gateway request ${ref.payboxRequestId} succeeded but no expectedPayer is on record to search for the settlement transfer -- this should not happen for a request created by this version of the adapter; check PayBox and Base directly`,
             };
         }
+        const fromBlock = record.searchFromBlock ? BigInt(record.searchFromBlock) : 0n;
+        // Frozen once, at prepare() time. A record from before this field
+        // existed gets a fallback computed HERE and persisted immediately below
+        // -- so it converges to one stable value from this point on, rather than
+        // silently recomputing (and therefore drifting) on every call.
+        const frozenToBlock = record.searchToBlock ? BigInt(record.searchToBlock) : fromBlock + GATEWAY_SEARCH_WINDOW_BLOCKS;
+        if (!record.searchToBlock) {
+            await this.store.set({ ...record, searchToBlock: frozenToBlock.toString() });
+        }
         const client = this.baseLogClient();
-        let toBlock;
+        let chainHead;
         try {
-            toBlock = await client.getBlockNumber();
+            chainHead = await client.getBlockNumber();
         }
         catch (err) {
             return { clientSubmissionKey, status: 'submission-ambiguous', reason: `could not reach Base to search for the settlement transfer: ${err?.message || 'no response'}`, retryAfterSeconds: 10 };
         }
-        const fromBlock = record.searchFromBlock ? BigInt(record.searchFromBlock) : 0n;
+        // Never query past the frozen upper bound, even if the chain has moved
+        // further -- a transfer beyond it must be ignored, not matched.
+        const effectiveToBlock = chainHead < frozenToBlock ? chainHead : frozenToBlock;
+        const windowExhausted = chainHead >= frozenToBlock;
         let logs;
         try {
             logs = await client.getLogs({
@@ -581,7 +634,7 @@ export class PayBoxCommerceExecutor {
                 event: USDC_TRANSFER_EVENT,
                 args: { from: record.expectedPayer, to: ref.recipient },
                 fromBlock,
-                toBlock,
+                toBlock: effectiveToBlock,
             });
         }
         catch (err) {
@@ -590,10 +643,20 @@ export class PayBoxCommerceExecutor {
         const expectedAmount = BigInt(ref.atomicAmount);
         const exact = logs.filter((log) => log.args?.value === expectedAmount);
         if (exact.length === 0) {
+            if (windowExhausted) {
+                // The frozen window (fromBlock..searchToBlock) has been fully
+                // searched with no match -- this will not resolve differently on
+                // further retry. Terminal, not endlessly ambiguous.
+                return {
+                    clientSubmissionKey,
+                    status: 'manual-recovery-required',
+                    reason: `PayBox gateway request ${ref.payboxRequestId} succeeded but no matching on-chain USDC transfer (payer ${record.expectedPayer} -> recipient ${ref.recipient}, ${ref.atomicAmount} atomic) was found in the full search window (blocks ${fromBlock}-${frozenToBlock}) -- the window is now exhausted; this will not resolve differently on retry`,
+                };
+            }
             return {
                 clientSubmissionKey,
                 status: 'submission-ambiguous',
-                reason: `PayBox gateway execution succeeded but no matching on-chain USDC transfer (payer ${record.expectedPayer} -> recipient ${ref.recipient}, ${ref.atomicAmount} atomic) has been observed yet in blocks ${fromBlock}-${toBlock} -- may still be settling`,
+                reason: `PayBox gateway execution succeeded but no matching on-chain USDC transfer (payer ${record.expectedPayer} -> recipient ${ref.recipient}, ${ref.atomicAmount} atomic) has been observed yet in blocks ${fromBlock}-${effectiveToBlock} (window open through ${frozenToBlock}) -- may still be settling`,
                 retryAfterSeconds: 10,
             };
         }
@@ -602,7 +665,7 @@ export class PayBoxCommerceExecutor {
             return {
                 clientSubmissionKey,
                 status: 'manual-recovery-required',
-                reason: `found ${exact.length} exactly-matching USDC transfers (payer ${record.expectedPayer} -> recipient ${ref.recipient}, ${ref.atomicAmount} atomic) in blocks ${fromBlock}-${toBlock} for PayBox gateway request ${ref.payboxRequestId} -- cannot uniquely identify the settlement transaction`,
+                reason: `found ${exact.length} exactly-matching USDC transfers (payer ${record.expectedPayer} -> recipient ${ref.recipient}, ${ref.atomicAmount} atomic) in blocks ${fromBlock}-${effectiveToBlock} for PayBox gateway request ${ref.payboxRequestId} -- cannot uniquely identify the settlement transaction`,
             };
         }
         const match = exact[0];

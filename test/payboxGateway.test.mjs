@@ -63,6 +63,13 @@ function makeExecutor({ paybox = new FakePayBoxClient(), store = new InMemoryPay
   }
 }
 
+test('D2.6 correction: gateway mode reports version "v1-gateway" (the explicit signal the server caps binding strength on); header mode is unchanged ("v1")', () => {
+  const gatewayExecutor = new PayBoxCommerceExecutor({ paybox: new FakePayBoxClient(), credentialId: CREDENTIAL_ID, store: new InMemoryPayBoxRequestStore(), mode: 'gateway' })
+  const headerExecutor = new PayBoxCommerceExecutor({ paybox: new FakePayBoxClient(), credentialId: CREDENTIAL_ID, store: new InMemoryPayBoxRequestStore() })
+  assert.equal(gatewayExecutor.version, 'v1-gateway')
+  assert.equal(headerExecutor.version, 'v1')
+})
+
 test('gateway mode: prepare() calls useService exactly once, never payX402', async () => {
   const { paybox, executor } = makeExecutor()
   const prepared = await executor.prepare({ clientSubmissionKey: 'g1', action: ACTION })
@@ -164,6 +171,105 @@ test('multiple exactly-matching transfers -> manual-recovery-required, never gue
   const outcome = await executor.submit(prepared)
   assert.equal(outcome.status, 'manual-recovery-required')
   assert.match(outcome.reason, /found 2 exactly-matching/)
+})
+
+// --- D2.6 correction: the search window is frozen at BOTH bounds, never expands indefinitely ---
+
+const GATEWAY_SEARCH_WINDOW_BLOCKS = 1800n // matches payboxExecutor.ts's own documented constant
+
+test('D2.6: exact transfer inside the frozen window -> transaction-known', async () => {
+  const { store, executor, baseReadClient } = makeExecutor()
+  const prepared = await executor.prepare({ clientSubmissionKey: 'g1', action: ACTION })
+  const record = await store.get('g1')
+  const from = BigInt(record.searchFromBlock)
+  baseReadClient.addTransfer({ blockNumber: from + 500n, transactionHash: '0xinwindow', blockHash: '0xb', logIndex: 0, from: PAYER, to: RECIPIENT, value: BigInt(ATOMIC_AMOUNT) })
+  const outcome = await executor.submit(prepared)
+  assert.equal(outcome.status, 'transaction-known')
+  assert.equal(outcome.transactionHash, '0xinwindow')
+})
+
+test('D2.6: an otherwise-exact transfer BEFORE the lower bound is ignored', async () => {
+  const { store, executor, baseReadClient, paybox } = makeExecutor()
+  const prepared = await executor.prepare({ clientSubmissionKey: 'g1', action: ACTION })
+  const record = await store.get('g1')
+  const from = BigInt(record.searchFromBlock)
+  // A transfer that predates the window (e.g. an unrelated historical payment) must never match.
+  baseReadClient.addTransfer({ blockNumber: from > 10n ? from - 10n : 0n, transactionHash: '0xtooearly', blockHash: '0xb', logIndex: 0, from: PAYER, to: RECIPIENT, value: BigInt(ATOMIC_AMOUNT) })
+  baseReadClient.advanceTo(from + 5n) // chain head still inside the window
+  const outcome = await executor.submit(prepared)
+  assert.equal(outcome.status, 'submission-ambiguous', 'a transfer before the window must be ignored, not matched')
+  assert.equal(paybox.useServiceCalls.length, 1)
+})
+
+test('D2.6: an otherwise-exact transfer AFTER the frozen upper bound is ignored', async () => {
+  const { store, executor, baseReadClient } = makeExecutor()
+  const prepared = await executor.prepare({ clientSubmissionKey: 'g1', action: ACTION })
+  const record = await store.get('g1')
+  const from = BigInt(record.searchFromBlock)
+  const to = from + GATEWAY_SEARCH_WINDOW_BLOCKS
+  // A transfer beyond the frozen upper bound -- e.g. an unrelated FUTURE
+  // payment between the same two addresses for the same amount -- must
+  // never become a false match for this old request.
+  baseReadClient.addTransfer({ blockNumber: to + 100n, transactionHash: '0xtoolate', blockHash: '0xb', logIndex: 0, from: PAYER, to: RECIPIENT, value: BigInt(ATOMIC_AMOUNT) })
+  const outcome = await executor.submit(prepared)
+  assert.equal(outcome.status, 'manual-recovery-required', 'the window is now exhausted (chain head is past it) with no in-window match')
+  assert.doesNotMatch(outcome.reason, /0xtoolate/)
+})
+
+test('D2.6: restart preserves the identical frozen lower/upper bounds', async () => {
+  const paybox = new FakePayBoxClient()
+  const store = new InMemoryPayBoxRequestStore()
+  const baseReadClient = new FakeBaseLogClient()
+  const executor1 = new PayBoxCommerceExecutor({ paybox, credentialId: CREDENTIAL_ID, store, mode: 'gateway', baseReadClient, fetch: probeFetch() })
+  const prepared = await executor1.prepare({ clientSubmissionKey: 'g1', action: ACTION })
+  const recordAfterPrepare = await store.get('g1')
+
+  // Advance the chain and resume from a FRESH executor instance (simulated restart).
+  baseReadClient.advanceTo(BigInt(recordAfterPrepare.searchFromBlock) + 50n)
+  const executor2 = new PayBoxCommerceExecutor({ paybox, credentialId: CREDENTIAL_ID, store, mode: 'gateway', baseReadClient, fetch: probeFetch() })
+  const generic = { clientSubmissionKey: 'g1', reference: { action: ACTION }, preparedAt: prepared.preparedAt }
+  await executor2.resume(generic)
+  const recordAfterResume = await store.get('g1')
+
+  assert.equal(recordAfterResume.searchFromBlock, recordAfterPrepare.searchFromBlock)
+  assert.equal(recordAfterResume.searchToBlock, recordAfterPrepare.searchToBlock)
+})
+
+test('D2.6: repeated resume never expands the candidate window (upper bound stays fixed across many polls)', async () => {
+  const { store, executor, baseReadClient } = makeExecutor()
+  const prepared = await executor.prepare({ clientSubmissionKey: 'g1', action: ACTION })
+  const record = await store.get('g1')
+  const frozenTo = record.searchToBlock
+
+  const generic = { clientSubmissionKey: 'g1', reference: { action: ACTION }, preparedAt: prepared.preparedAt }
+  for (let i = 0; i < 5; i++) {
+    baseReadClient.advanceTo(BigInt(record.searchFromBlock) + BigInt(i) * 100n)
+    await executor.resume(generic)
+    const current = await store.get('g1')
+    assert.equal(current.searchToBlock, frozenTo, `searchToBlock must never change across repeated resume() calls (iteration ${i})`)
+  }
+})
+
+test('D2.6: zero candidates while the window is still open -> recoverable submission-ambiguous', async () => {
+  const { store, executor, baseReadClient } = makeExecutor()
+  const prepared = await executor.prepare({ clientSubmissionKey: 'g1', action: ACTION })
+  const record = await store.get('g1')
+  baseReadClient.advanceTo(BigInt(record.searchFromBlock) + 10n) // well inside the window, no transfers
+  const outcome = await executor.submit(prepared)
+  assert.equal(outcome.status, 'submission-ambiguous')
+  assert.match(outcome.reason, /may still be settling/)
+  assert.ok(outcome.retryAfterSeconds > 0)
+})
+
+test('D2.6: window exhausted with no candidate -> honest manual-recovery-required, not endless ambiguity', async () => {
+  const { store, executor, baseReadClient, paybox } = makeExecutor()
+  const prepared = await executor.prepare({ clientSubmissionKey: 'g1', action: ACTION })
+  const record = await store.get('g1')
+  baseReadClient.advanceTo(BigInt(record.searchToBlock) + 1n) // chain head now past the frozen upper bound, no transfers ever added
+  const outcome = await executor.submit(prepared)
+  assert.equal(outcome.status, 'manual-recovery-required')
+  assert.match(outcome.reason, /window is now exhausted/)
+  assert.equal(paybox.useServiceCalls.length, 1, 'an exhausted window must never trigger a second useService call')
 })
 
 test('a transfer with the wrong payer, recipient, or amount is ignored', async () => {

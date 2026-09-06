@@ -15,6 +15,11 @@ export class FakeBaseLogClient {
     if (blockNumber > this.currentBlock) this.currentBlock = blockNumber
   }
 
+  /** Test helper: advance the chain head WITHOUT adding any transfer -- used to simulate the window exhausting with no candidate ever appearing. */
+  advanceTo(blockNumber) {
+    if (blockNumber > this.currentBlock) this.currentBlock = blockNumber
+  }
+
   async getBlockNumber() {
     return this.currentBlock
   }
