@@ -16,8 +16,8 @@
       "import": "./dist/commerce/index.js"
     },
     "./commerce/node": {
-      "types": "./dist/commerce/nodeFileRecoveryStore.d.ts",
-      "import": "./dist/commerce/nodeFileRecoveryStore.js"
+      "types": "./dist/commerce/node.d.ts",
+      "import": "./dist/commerce/node.js"
     }
   },
   "files": [
