@@ -1,7 +1,7 @@
 {
   "name": "@onchaindiligence/sdk",
   "version": "0.4.0",
-  "description": "Typed client for the OnchainDiligence compliance API — pay-per-call sanctions, OFAC name, and UK company checks, with the 402 payment flow handled for you.",
+  "description": "TypeScript SDK for OnChainDiligence — policy preflight, recoverable agent payment lifecycles, independent settlement observation, and verifiable receipts.",
   "type": "module",
   "main": "./dist/index.js",
   "module": "./dist/index.js",
@@ -30,15 +30,23 @@
     "prepublishOnly": "npm run build"
   },
   "keywords": [
+    "agent-payments",
+    "ai-agents",
+    "x402",
+    "402",
+    "payments",
+    "receipts",
+    "verification",
+    "mcp",
+    "base",
+    "usdc",
+    "web3",
     "compliance",
     "sanctions",
     "ofac",
-    "x402",
-    "402",
     "mppx",
     "tempo",
-    "agent",
-    "web3"
+    "agent"
   ],
   "license": "MIT",
   "peerDependencies": {
