@@ -24,6 +24,34 @@ export class RecoveryRequiredError extends Error {
         this.name = 'RecoveryRequiredError';
     }
 }
+/**
+ * D2.6 correction: thrown by attachProviderReferenceStrict() when the
+ * server's execution binding already has a DIFFERENT provider_reference
+ * than the one this call tried to attach (HTTP 409 -- see
+ * onchaindiligence-mcp's ProviderReferenceConflictError, the authoritative
+ * source of this decision; this class only carries the server's message
+ * through, never re-derives the conflict itself). Distinguished from
+ * ProviderReferenceAttachTransientError so a caller can tell "this will
+ * never resolve on retry, a human must look" from "try again later."
+ */
+export class ProviderReferenceAttachConflictError extends Error {
+    constructor(message) {
+        super(message);
+        this.name = 'ProviderReferenceAttachConflictError';
+    }
+}
+/**
+ * D2.6 correction: thrown by attachProviderReferenceStrict() for a network
+ * failure or a non-409 non-2xx HTTP response -- recoverable by retrying the
+ * SAME attach call later (the durable request identity this reference
+ * refers to is untouched either way).
+ */
+export class ProviderReferenceAttachTransientError extends Error {
+    constructor(message) {
+        super(message);
+        this.name = 'ProviderReferenceAttachTransientError';
+    }
+}
 function mapExecutorIdToProvider(executorId) {
     if (executorId === 'x402-base-usdc-exact')
         return 'x402';
@@ -463,25 +491,76 @@ export class CommerceOperation {
         const outcome = await executor.submit(prepared);
         return this.applyExecutionOutcome(outcome);
     }
+    /**
+     * D2.6 correction: a known providerReference must be durably attached to
+     * the server-side execution binding BEFORE this method persists any LOCAL
+     * terminal state that would prevent a future retry of that attachment.
+     * Concretely: once `transactionHash` lands in the recovery record,
+     * executeLocked()'s own short-circuit (`if (this.record.transactionHash)
+     * return execution-recorded`) means executor.resume() — and therefore any
+     * further attempt to attach the provider reference — is NEVER called
+     * again. So for `transaction-known`, the attach is a hard gate: on
+     * success, proceed exactly as before; on a genuine conflict, stop and
+     * report manual-recovery-required (never overwrite the server's existing
+     * reference, never create a second PayBox request); on a transient
+     * failure, return `pending` WITHOUT touching `transactionHash` at all --
+     * the executor's OWN store already has the transaction hash durably
+     * (PayBoxCommerceExecutor persists it before ever returning
+     * transaction-known), so calling executor.resume() again on the next
+     * op.execute() reproduces the SAME outcome and retries the SAME
+     * attachment, deterministically, with no new provider call.
+     *
+     * For `submission-ambiguous` and `manual-recovery-required`, neither of
+     * which persists any local terminal state that could block a retry, the
+     * attach is attempted best-effort (Section 5: "attach durably as soon as
+     * practical" / "attempt to preserve the correlation too") without gating
+     * the returned result on it — a subsequent op.execute() naturally retries
+     * both the PayBox poll and this attachment together.
+     */
     async applyExecutionOutcome(outcome) {
         const executionRequestId = this.record.executionRequestId;
         if (outcome.status === 'transaction-known') {
+            if (outcome.providerReference) {
+                try {
+                    await this.attachProviderReferenceStrict(executionRequestId, outcome.providerReference);
+                }
+                catch (err) {
+                    if (err instanceof ProviderReferenceAttachConflictError) {
+                        await this.casUpdate({ localPhase: 'provider-reference-conflict' });
+                        return {
+                            kind: 'manual-recovery-required',
+                            operationId: this.operationId,
+                            executionRequestId,
+                            reason: `provider reference conflict while correlating this execution to the OCD execution binding: ${err.message} -- this operation requires manual investigation and will not be automatically retried into a new PayBox request`,
+                        };
+                    }
+                    // Transient (network/5xx/non-conflict non-2xx): deliberately do
+                    // NOT persist transactionHash here -- see this method's header.
+                    await this.casUpdate({ localPhase: 'provider-reference-attach-pending' });
+                    return pending(this.operationId, {
+                        phase: 'execution-ambiguous',
+                        safeNextAction: 'call op.execute() again -- the transaction is already known; this will retry attaching the same PayBox provider reference to the existing execution binding, without calling useService() or searching for a different transaction again',
+                        mayAlreadyHavePaid: true,
+                        executionRequestId,
+                    });
+                }
+            }
             await this.casUpdate({ transactionHash: outcome.transactionHash, localPhase: 'execution-complete' });
-            await this.updateBindingState(executionRequestId, 'transaction_known', outcome.providerReference);
+            await this.updateBindingState(executionRequestId, 'transaction_known');
             return { kind: 'execution-recorded', operationId: this.operationId, executionRequestId, transactionHash: outcome.transactionHash, providerReference: outcome.providerReference };
         }
         if (outcome.status === 'manual-recovery-required') {
             await this.casUpdate({ localPhase: 'manual-recovery-required' });
-            await this.updateBindingState(executionRequestId, 'manual_recovery_required', outcome.providerReference);
+            if (outcome.providerReference)
+                await this.attachProviderReferenceBestEffort(executionRequestId, outcome.providerReference);
+            await this.updateBindingState(executionRequestId, 'manual_recovery_required');
             return { kind: 'manual-recovery-required', operationId: this.operationId, executionRequestId, reason: outcome.reason };
         }
         // submission-ambiguous
         await this.casUpdate({ localPhase: 'execution-ambiguous' });
-        // D2.6 correction: attach providerReference here too, as soon as it's
-        // known -- an executor whose provider action happens in submit() (e.g.
-        // PayBox gateway mode) can learn its own request id well before a
-        // transaction is known. Never wait for transaction-known to correlate it.
-        await this.updateBindingState(executionRequestId, 'submission_ambiguous', outcome.providerReference);
+        if (outcome.providerReference)
+            await this.attachProviderReferenceBestEffort(executionRequestId, outcome.providerReference);
+        await this.updateBindingState(executionRequestId, 'submission_ambiguous');
         return pending(this.operationId, {
             phase: 'execution-ambiguous',
             safeNextAction: 'call op.execute() again -- it will call executor.resume(), never submit() a second time, for this execution',
@@ -491,24 +570,52 @@ export class CommerceOperation {
         });
     }
     /**
-     * Best-effort mirror of the binding's submission_state and (D2.6
-     * correction) its provider_reference -- the LOCAL record + the binding's
-     * OWN prior state remain authoritative for resume logic either way.
-     * `providerReference` is attached server-side via the SAME one-way
-     * null -> value transition executionBinding.ts's attachProviderReference()
-     * enforces (idempotent on retry with the identical value, rejected on a
-     * genuine conflict) -- this call never fabricates a stronger correlation
-     * than what the executor itself reported.
+     * D2.6 correction: strictly attaches `providerReference` to the ALREADY-
+     * EXISTING execution binding via the SAME state endpoint the submission-
+     * state mirror uses -- makes NO new execution binding, performs NO
+     * payment, sends ONLY `provider_reference` (no `state`). Checks the actual
+     * HTTP response: 2xx (including the idempotent "already exactly this
+     * value" case, which the server itself treats as success) resolves
+     * normally; HTTP 409 throws ProviderReferenceAttachConflictError; any
+     * other non-2xx or a network failure throws
+     * ProviderReferenceAttachTransientError. Never silently swallows a
+     * failure -- that is the caller's job to decide, per outcome kind (see
+     * applyExecutionOutcome()). The server (onchaindiligence-mcp's
+     * attachProviderReference()/updateExecutionBindingProviderReference())
+     * remains the sole authority for the null -> value / same-value-idempotent
+     * / different-value-conflict decision -- this method never re-derives or
+     * duplicates that logic client-side.
      */
-    async updateBindingState(executionRequestId, state, providerReference) {
-        const body = { state };
-        if (providerReference)
-            body.provider_reference = providerReference;
+    async attachProviderReferenceStrict(executionRequestId, providerReference) {
+        let res;
+        try {
+            res = await this.client.apiFetch(`/operations/${encodeURIComponent(this.operationId)}/execution-bindings/${encodeURIComponent(executionRequestId)}/state`, {
+                method: 'POST',
+                headers: { 'content-type': 'application/json', [RECOVERY_HEADER]: this.record.recoveryCredential },
+                body: JSON.stringify({ provider_reference: providerReference }),
+            });
+        }
+        catch (err) {
+            throw new ProviderReferenceAttachTransientError(`could not reach OCD to attach provider_reference: ${err?.message || 'no response'}`);
+        }
+        if (res.status === 409) {
+            throw new ProviderReferenceAttachConflictError(await this.client.readError(res));
+        }
+        if (!res.ok) {
+            throw new ProviderReferenceAttachTransientError(`attaching provider_reference failed: HTTP ${res.status} ${await this.client.readError(res)}`);
+        }
+    }
+    /** Same call as attachProviderReferenceStrict(), but for outcomes that never persist a local terminal state a failed attach could block -- see applyExecutionOutcome()'s header for why these two paths differ. */
+    async attachProviderReferenceBestEffort(executionRequestId, providerReference) {
+        await this.attachProviderReferenceStrict(executionRequestId, providerReference).catch(() => { });
+    }
+    /** Best-effort mirror of the binding's submission_state only (D2.6 correction: provider_reference now goes exclusively through attachProviderReferenceStrict()/BestEffort() above, never through this call) -- the LOCAL record + the binding's OWN prior state remain authoritative for resume logic either way. */
+    async updateBindingState(executionRequestId, state) {
         await this.client
             .apiFetch(`/operations/${encodeURIComponent(this.operationId)}/execution-bindings/${encodeURIComponent(executionRequestId)}/state`, {
             method: 'POST',
             headers: { 'content-type': 'application/json', [RECOVERY_HEADER]: this.record.recoveryCredential },
-            body: JSON.stringify(body),
+            body: JSON.stringify({ state }),
         })
             .catch(() => { }); // best-effort mirror; the LOCAL record + the binding's OWN prior state remain authoritative for resume logic
     }

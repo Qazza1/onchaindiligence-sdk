@@ -33,6 +33,28 @@ export declare class PreflightNotAllowedError extends Error {
 export declare class RecoveryRequiredError extends Error {
     constructor(operationId: string);
 }
+/**
+ * D2.6 correction: thrown by attachProviderReferenceStrict() when the
+ * server's execution binding already has a DIFFERENT provider_reference
+ * than the one this call tried to attach (HTTP 409 -- see
+ * onchaindiligence-mcp's ProviderReferenceConflictError, the authoritative
+ * source of this decision; this class only carries the server's message
+ * through, never re-derives the conflict itself). Distinguished from
+ * ProviderReferenceAttachTransientError so a caller can tell "this will
+ * never resolve on retry, a human must look" from "try again later."
+ */
+export declare class ProviderReferenceAttachConflictError extends Error {
+    constructor(message: string);
+}
+/**
+ * D2.6 correction: thrown by attachProviderReferenceStrict() for a network
+ * failure or a non-409 non-2xx HTTP response -- recoverable by retrying the
+ * SAME attach call later (the durable request identity this reference
+ * refers to is untouched either way).
+ */
+export declare class ProviderReferenceAttachTransientError extends Error {
+    constructor(message: string);
+}
 export interface CreateCommerceClientOptions {
     /** Base URL of the OCD MCP/x402 server. Defaults to production. */
     endpoint?: string;
@@ -141,17 +163,54 @@ export declare class CommerceOperation {
         executor: CommerceExecutor;
     }): Promise<ExecutionRecord>;
     private executeLocked;
+    /**
+     * D2.6 correction: a known providerReference must be durably attached to
+     * the server-side execution binding BEFORE this method persists any LOCAL
+     * terminal state that would prevent a future retry of that attachment.
+     * Concretely: once `transactionHash` lands in the recovery record,
+     * executeLocked()'s own short-circuit (`if (this.record.transactionHash)
+     * return execution-recorded`) means executor.resume() — and therefore any
+     * further attempt to attach the provider reference — is NEVER called
+     * again. So for `transaction-known`, the attach is a hard gate: on
+     * success, proceed exactly as before; on a genuine conflict, stop and
+     * report manual-recovery-required (never overwrite the server's existing
+     * reference, never create a second PayBox request); on a transient
+     * failure, return `pending` WITHOUT touching `transactionHash` at all --
+     * the executor's OWN store already has the transaction hash durably
+     * (PayBoxCommerceExecutor persists it before ever returning
+     * transaction-known), so calling executor.resume() again on the next
+     * op.execute() reproduces the SAME outcome and retries the SAME
+     * attachment, deterministically, with no new provider call.
+     *
+     * For `submission-ambiguous` and `manual-recovery-required`, neither of
+     * which persists any local terminal state that could block a retry, the
+     * attach is attempted best-effort (Section 5: "attach durably as soon as
+     * practical" / "attempt to preserve the correlation too") without gating
+     * the returned result on it — a subsequent op.execute() naturally retries
+     * both the PayBox poll and this attachment together.
+     */
     private applyExecutionOutcome;
     /**
-     * Best-effort mirror of the binding's submission_state and (D2.6
-     * correction) its provider_reference -- the LOCAL record + the binding's
-     * OWN prior state remain authoritative for resume logic either way.
-     * `providerReference` is attached server-side via the SAME one-way
-     * null -> value transition executionBinding.ts's attachProviderReference()
-     * enforces (idempotent on retry with the identical value, rejected on a
-     * genuine conflict) -- this call never fabricates a stronger correlation
-     * than what the executor itself reported.
+     * D2.6 correction: strictly attaches `providerReference` to the ALREADY-
+     * EXISTING execution binding via the SAME state endpoint the submission-
+     * state mirror uses -- makes NO new execution binding, performs NO
+     * payment, sends ONLY `provider_reference` (no `state`). Checks the actual
+     * HTTP response: 2xx (including the idempotent "already exactly this
+     * value" case, which the server itself treats as success) resolves
+     * normally; HTTP 409 throws ProviderReferenceAttachConflictError; any
+     * other non-2xx or a network failure throws
+     * ProviderReferenceAttachTransientError. Never silently swallows a
+     * failure -- that is the caller's job to decide, per outcome kind (see
+     * applyExecutionOutcome()). The server (onchaindiligence-mcp's
+     * attachProviderReference()/updateExecutionBindingProviderReference())
+     * remains the sole authority for the null -> value / same-value-idempotent
+     * / different-value-conflict decision -- this method never re-derives or
+     * duplicates that logic client-side.
      */
+    private attachProviderReferenceStrict;
+    /** Same call as attachProviderReferenceStrict(), but for outcomes that never persist a local terminal state a failed attach could block -- see applyExecutionOutcome()'s header for why these two paths differ. */
+    private attachProviderReferenceBestEffort;
+    /** Best-effort mirror of the binding's submission_state only (D2.6 correction: provider_reference now goes exclusively through attachProviderReferenceStrict()/BestEffort() above, never through this call) -- the LOCAL record + the binding's OWN prior state remain authoritative for resume logic either way. */
     private updateBindingState;
     observeAndFinalize(): Promise<FinalizeResult>;
     /**

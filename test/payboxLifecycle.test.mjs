@@ -18,11 +18,13 @@ import {
   PayBoxStoreRequiredError,
   PayBoxAmbiguousPrepareError,
   PreflightNotAllowedError,
+  MockCommerceExecutor,
   PAYBOX_BASE_NETWORK,
   PAYBOX_BASE_USDC,
 } from '../dist/commerce/index.js'
 import { createFakeServer } from './fakeServer.mjs'
 import { FakePayBoxClient } from './fakePayboxClient.mjs'
+import { FakeBaseLogClient } from './fakeBaseLogClient.mjs'
 
 const RECIPIENT = '0x000000000000000000000000000000000000dEaD'
 const RESOURCE_URL = 'https://service.example/api'
@@ -336,4 +338,204 @@ test('D2.6 FINAL: provider_reference is attached to the execution binding as soo
     `paybox:${payboxRequestId}`,
     'provider_reference must already be attached even though the overall outcome is still pending, not only once transaction-known'
   )
+})
+
+// --- D2.6 durability correction: provider_reference must be durably attached BEFORE local terminal state ---
+
+/**
+ * Wraps a fakeServer's fetch so calls to the execution-bindings state
+ * endpoint that carry ONLY `provider_reference` (no `state` -- i.e. the
+ * strict attach, never the best-effort submission_state mirror) can be
+ * made to fail on demand, then succeed. `conflict: true` always returns
+ * 409; otherwise the first `failCount` such calls return 503, and every
+ * call after that (or every call, if `failCount` is 0) passes through to
+ * the real fake server.
+ */
+function makeAttachFailingFetch(server, { failCount = 0, throwNetworkError = false, conflict = false } = {}) {
+  let attachAttempts = 0
+  return async (url, init) => {
+    const pathname = new URL(url).pathname
+    const method = (init?.method || 'GET').toUpperCase()
+    const isStateRoute = /\/execution-bindings\/[^/]+\/state$/.test(pathname) && method === 'POST'
+    if (isStateRoute && init?.body) {
+      const body = JSON.parse(init.body)
+      const isStrictAttach = body.provider_reference !== undefined && body.state === undefined
+      if (isStrictAttach) {
+        attachAttempts++
+        if (conflict) {
+          return new Response(JSON.stringify({ error: 'execution binding already has a different provider_reference' }), { status: 409, headers: { 'content-type': 'application/json' } })
+        }
+        if (attachAttempts <= failCount) {
+          if (throwNetworkError) throw new Error('simulated network drop')
+          return new Response(JSON.stringify({ error: 'simulated transient failure' }), { status: 503, headers: { 'content-type': 'application/json' } })
+        }
+      }
+    }
+    return server.fetch(url, init)
+  }
+}
+
+function gatewayExecutorWithMatchingTransfer({ paybox = new FakePayBoxClient(), store = new InMemoryPayBoxRequestStore(), transactionHash = '0x' + 'ee'.repeat(32) } = {}) {
+  const baseReadClient = new FakeBaseLogClient()
+  // Pre-add the transfer at the store's default start block -- submitGateway()'s
+  // own getBlockNumber() call (moments later, inside the SAME execute() call)
+  // returns this exact bumped value as searchFromBlock, so the transfer is
+  // always found on the very first attempt, in one execute() call.
+  baseReadClient.addTransfer({ blockNumber: 1005n, transactionHash, blockHash: '0xblock', logIndex: 0, from: PAYER, to: RECIPIENT, value: 1_000_000n })
+  const executor = new PayBoxCommerceExecutor({ paybox, credentialId: CREDENTIAL_ID, store, mode: 'gateway', baseReadClient, fetch: merchantFetch('0x' + 'ff'.repeat(32)) })
+  return { paybox, store, baseReadClient, executor }
+}
+
+test('D2.6 durability #1/#9: provider_reference attaches BEFORE local transactionHash becomes terminal; a successful attachment lets transaction-known proceed normally', async () => {
+  const server = createFakeServer()
+  let sawTransactionHashDuringAttach
+  let op
+  const spyFetch = async (url, init) => {
+    const pathname = new URL(url).pathname
+    if (/\/execution-bindings\/[^/]+\/state$/.test(pathname) && init?.body) {
+      const body = JSON.parse(init.body)
+      if (body.provider_reference !== undefined && body.state === undefined) {
+        sawTransactionHashDuringAttach = op.currentRecord().transactionHash
+      }
+    }
+    return server.fetch(url, init)
+  }
+  const client = createCommerceClient({ recovery: new InMemoryRecoveryStore(), fetch: spyFetch })
+  op = await client.open({ action: GATEWAY_ACTION, policy: POLICY })
+  assert.equal((await op.preflight()).kind, 'ready')
+
+  const { executor } = gatewayExecutorWithMatchingTransfer()
+  const execution = await op.execute({ executor })
+
+  assert.equal(sawTransactionHashDuringAttach, null, 'transactionHash must still be null in the local record at the moment the attach call is made')
+  assert.equal(execution.kind, 'execution-recorded', 'a successful attachment must let transaction-known proceed exactly as before')
+  assert.equal(op.currentRecord().transactionHash, execution.transactionHash)
+})
+
+test('D2.6 durability #2/#3/#4: a transient provider-reference attach failure does not make the execution permanently terminal, uses the same request_id, and never calls useService twice', async () => {
+  const server = createFakeServer()
+  const failingFetch = makeAttachFailingFetch(server, { failCount: 1 })
+  const client = createCommerceClient({ recovery: new InMemoryRecoveryStore(), fetch: failingFetch })
+  const op = await client.open({ action: GATEWAY_ACTION, policy: POLICY })
+  assert.equal((await op.preflight()).kind, 'ready')
+
+  const { paybox, executor } = gatewayExecutorWithMatchingTransfer()
+
+  const first = await op.execute({ executor })
+  assert.equal(first.kind, 'pending', 'a transient attach failure must not be reported as a fabricated success or a hard failure')
+  assert.equal(op.currentRecord().transactionHash, null, 'transactionHash must NOT be persisted locally while the attach is unresolved')
+  assert.equal(paybox.useServiceCalls.length, 1)
+  const [payboxRequestId] = [...paybox.requests.keys()]
+
+  const second = await op.execute({ executor })
+  assert.equal(second.kind, 'execution-recorded', 'retrying must succeed once the attach itself succeeds')
+  assert.equal(paybox.useServiceCalls.length, 1, 'useService must never be called a second time across the retry')
+  const [onlyPayboxRequestId] = [...paybox.requests.keys()]
+  assert.equal(onlyPayboxRequestId, payboxRequestId, 'the retry must resume the SAME PayBox request_id, never a new one')
+})
+
+test('D2.6 durability #5: retrying an identical provider_reference after the server already attached it succeeds idempotently (lost-response simulation)', async () => {
+  const server = createFakeServer()
+  const client = createCommerceClient({ recovery: new InMemoryRecoveryStore(), fetch: server.fetch })
+  const op = await client.open({ action: GATEWAY_ACTION, policy: POLICY })
+  assert.equal((await op.preflight()).kind, 'ready')
+
+  const { executor } = gatewayExecutorWithMatchingTransfer()
+  const first = await op.execute({ executor })
+  assert.equal(first.kind, 'execution-recorded')
+
+  // A second, independent attempt to attach the EXACT same reference (as if
+  // the client had lost the first success response) must be a no-op success.
+  const binding = server.getExecutionBinding(first.executionRequestId)
+  await assert.doesNotReject(() =>
+    server.fetch(`https://mcp.onchaindiligence.com/operations/${op.operationId}/execution-bindings/${first.executionRequestId}/state`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ provider_reference: binding.providerReference }),
+    })
+  )
+})
+
+test('D2.6 durability #6/#7/#8: an HTTP 409 conflicting provider_reference is surfaced, never overwrites the original, and never triggers a second PayBox request', async () => {
+  const server = createFakeServer()
+  const failingFetch = makeAttachFailingFetch(server, { conflict: true })
+  const client = createCommerceClient({ recovery: new InMemoryRecoveryStore(), fetch: failingFetch })
+  const op = await client.open({ action: GATEWAY_ACTION, policy: POLICY })
+  assert.equal((await op.preflight()).kind, 'ready')
+
+  const { paybox, executor } = gatewayExecutorWithMatchingTransfer()
+  const execution = await op.execute({ executor })
+
+  assert.equal(execution.kind, 'manual-recovery-required', 'a genuine conflict must be surfaced, never swallowed into a fabricated success')
+  assert.match(execution.reason, /conflict/i)
+  assert.equal(op.currentRecord().transactionHash, null, 'transactionHash must never be persisted locally when the server-side correlation conflicts')
+  assert.equal(paybox.useServiceCalls.length, 1, 'a conflict must never trigger a second PayBox request')
+
+  // Retrying again must keep reporting the same conflict, never "recover" into a fabricated success.
+  const retried = await op.execute({ executor })
+  assert.equal(retried.kind, 'manual-recovery-required')
+  assert.equal(paybox.useServiceCalls.length, 1)
+})
+
+test('D2.6 durability #10: observeAndFinalize cannot proceed while a provider-reference correlation failure is unresolved', async () => {
+  const server = createFakeServer()
+  const failingFetch = makeAttachFailingFetch(server, { conflict: true })
+  const client = createCommerceClient({ recovery: new InMemoryRecoveryStore(), fetch: failingFetch })
+  const op = await client.open({ action: GATEWAY_ACTION, policy: POLICY })
+  assert.equal((await op.preflight()).kind, 'ready')
+
+  const { executor } = gatewayExecutorWithMatchingTransfer()
+  const execution = await op.execute({ executor })
+  assert.equal(execution.kind, 'manual-recovery-required')
+
+  const finalize = await op.observeAndFinalize()
+  assert.equal(finalize.kind, 'pending', 'observeAndFinalize() must refuse to proceed -- no transactionHash was ever persisted locally for an unresolved correlation')
+})
+
+test('D2.6 durability #11: submission-ambiguous with a known request_id retries provider-reference synchronization safely (best-effort, non-blocking)', async () => {
+  const server = createFakeServer()
+  const failingFetch = makeAttachFailingFetch(server, { failCount: 1 })
+  const client = createCommerceClient({ recovery: new InMemoryRecoveryStore(), fetch: failingFetch })
+  const op = await client.open({ action: GATEWAY_ACTION, policy: POLICY })
+  assert.equal((await op.preflight()).kind, 'ready')
+
+  const paybox = new FakePayBoxClient()
+  paybox.onUseService = (input, c) => {
+    const id = 'gw-req-still-pending'
+    c.requests.set(id, { request_id: id, status: 'pending_approval' })
+    return { request_id: id, status: 'pending_approval' }
+  }
+  const executor = new PayBoxCommerceExecutor({ paybox, credentialId: CREDENTIAL_ID, store: new InMemoryPayBoxRequestStore(), mode: 'gateway', fetch: merchantFetch('0x' + 'aa'.repeat(32)) })
+
+  const first = await op.execute({ executor })
+  assert.equal(first.kind, 'pending')
+  assert.equal(paybox.useServiceCalls.length, 1)
+
+  const second = await op.execute({ executor })
+  assert.equal(second.kind, 'pending', 'still pending_approval -- the best-effort attach retry must not change the underlying PayBox status')
+  assert.equal(paybox.useServiceCalls.length, 1, 'useService must never be called again while retrying provider-reference synchronization')
+})
+
+test('D2.6 durability #12: an executor without providerReference (e.g. MockCommerceExecutor) keeps its current, unaffected behavior', async () => {
+  const server = createFakeServer()
+  const client = createCommerceClient({ recovery: new InMemoryRecoveryStore(), fetch: server.fetch })
+  const op = await client.open({ action: ACTION, policy: POLICY })
+  assert.equal((await op.preflight()).kind, 'ready')
+
+  const execution = await op.execute({ executor: new MockCommerceExecutor() })
+  assert.equal(execution.kind, 'execution-recorded')
+  assert.ok(execution.transactionHash.startsWith('0x'))
+})
+
+test('D2.6 durability #13: gateway remains TRANSFER_MATCH_ONLY-eligible (executorVersion "v1-gateway") after a successful provider_reference attachment', async () => {
+  const server = createFakeServer()
+  const client = createCommerceClient({ recovery: new InMemoryRecoveryStore(), fetch: server.fetch })
+  const op = await client.open({ action: GATEWAY_ACTION, policy: POLICY })
+  assert.equal((await op.preflight()).kind, 'ready')
+
+  const { executor } = gatewayExecutorWithMatchingTransfer()
+  assert.equal(executor.version, 'v1-gateway', 'gateway mode must keep reporting the distinct executor_version the server keys its TRANSFER_MATCH_ONLY cap on')
+  const execution = await op.execute({ executor })
+  assert.equal(execution.kind, 'execution-recorded')
+  assert.equal(executor.version, 'v1-gateway', 'the durability fix (provider_reference attachment) must never mutate executor identity/version after execution')
 })
