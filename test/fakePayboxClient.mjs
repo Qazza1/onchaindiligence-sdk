@@ -9,11 +9,14 @@
 export class FakePayBoxClient {
   constructor() {
     this.payX402Calls = []
+    this.useServiceCalls = []
     this.getRequestCalls = []
     this.requests = new Map() // request_id -> envelope
     this.nextRequestId = 1
     /** Override: (input, client) => envelope | throws. Defaults to an immediate 'success'. */
     this.onPayX402 = null
+    /** Override: (input, client) => envelope | throws. Defaults to an immediate gateway 'success'. */
+    this.onUseService = null
     /** Override: (requestId, client) => envelope | throws. Defaults to returning whatever is on record. */
     this.onGetRequest = null
   }
@@ -23,6 +26,26 @@ export class FakePayBoxClient {
     if (this.onPayX402) return this.onPayX402(input, this)
     const requestId = `paybox-req-${this.nextRequestId++}`
     const envelope = { request_id: requestId, status: 'success', output: { value: { x_payment: { header: 'X-PAYMENT', value: `signed-for-${requestId}` } } } }
+    this.requests.set(requestId, envelope)
+    return envelope
+  }
+
+  async useService(input) {
+    this.useServiceCalls.push(input)
+    if (this.onUseService) return this.onUseService(input, this)
+    const requestId = `paybox-gw-req-${this.nextRequestId++}`
+    const envelope = {
+      request_id: requestId,
+      status: 'success',
+      output_id: `output-${requestId}`,
+      audit_id: `audit-${requestId}`,
+      output: {
+        value: {
+          payment: { gateway: true, header_available: false, header_name: 'PAYMENT-SIGNATURE', network: 'eip155:8453', ok: true, proof_status: 'created', scheme: 'exact', status: 'succeeded' },
+          response: { status: 200, ok: true, body: { result: '0x0' } },
+        },
+      },
+    }
     this.requests.set(requestId, envelope)
     return envelope
   }
