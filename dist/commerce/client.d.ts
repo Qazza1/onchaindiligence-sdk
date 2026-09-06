@@ -142,6 +142,16 @@ export declare class CommerceOperation {
     }): Promise<ExecutionRecord>;
     private executeLocked;
     private applyExecutionOutcome;
+    /**
+     * Best-effort mirror of the binding's submission_state and (D2.6
+     * correction) its provider_reference -- the LOCAL record + the binding's
+     * OWN prior state remain authoritative for resume logic either way.
+     * `providerReference` is attached server-side via the SAME one-way
+     * null -> value transition executionBinding.ts's attachProviderReference()
+     * enforces (idempotent on retry with the identical value, rejected on a
+     * genuine conflict) -- this call never fabricates a stronger correlation
+     * than what the executor itself reported.
+     */
     private updateBindingState;
     observeAndFinalize(): Promise<FinalizeResult>;
     /**

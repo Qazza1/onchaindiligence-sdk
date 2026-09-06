@@ -241,6 +241,23 @@ export declare class PayBoxCommerceExecutor implements CommerceExecutor {
     prepare(context: PrepareContext): Promise<PrepareResult>;
     private toPrepareResult;
     submit(prepared: PrepareResult): Promise<ExecutionResult>;
+    /**
+     * Gateway mode's ENTIRE state-changing action (D2.6 correction). Called by
+     * the orchestrator only after the durable OCD execution binding already
+     * exists (client.ts's executeLocked() registers it between prepare() and
+     * submit()) -- so by the time useService() can possibly run, OCD already
+     * has a durable row to resume from.
+     *
+     * Atomically claims the submission slot itself (the SAME
+     * PayBoxRequestStore.claim() mechanism prepare() used to use): exactly one
+     * concurrent `submit()` call (e.g. two racing processes that both reached
+     * the "register a new binding" branch) may proceed to call useService().
+     * The search window's bounds are frozen HERE, immediately before the one
+     * useService() call -- tied to the actual provider submission attempt,
+     * never to whenever prepare() happened to run (Section 6).
+     */
+    private submitGateway;
+    private refFromRecord;
     resume(prepared: PrepareResult, priorOutcome?: ExecutionResult): Promise<ExecutionResult>;
     /**
      * Shared by submit() (first check, right after prepare()) and resume()

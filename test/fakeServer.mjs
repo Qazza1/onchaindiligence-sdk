@@ -175,10 +175,22 @@ export function createFakeServer(options = {}) {
       const [, operationId, executionRequestId] = stateMatch
       const binding = executionBindings.get(executionRequestId)
       if (!binding) return json({ error: 'unknown binding' }, 404)
-      binding.submissionState = bodyJson.state
-      const op = operations.get(operationId)
-      if (op) op.executionState = bodyJson.state
-      return json({ execution_request_id: executionRequestId, submission_state: bodyJson.state })
+      // D2.6 correction: mirrors the real server's one-way provider_reference
+      // attach (null -> a value, idempotent on retry with the SAME value,
+      // rejected on a genuine conflict) -- see onchaindiligence-mcp's
+      // attachProviderReference()/updateExecutionBindingProviderReference().
+      if (bodyJson.provider_reference !== undefined) {
+        if (binding.providerReference !== null && binding.providerReference !== bodyJson.provider_reference) {
+          return json({ error: `execution binding ${executionRequestId} already has provider_reference "${binding.providerReference}" -- refusing to overwrite it with "${bodyJson.provider_reference}"` }, 409)
+        }
+        binding.providerReference = bodyJson.provider_reference
+      }
+      if (bodyJson.state !== undefined) {
+        binding.submissionState = bodyJson.state
+        const op = operations.get(operationId)
+        if (op) op.executionState = bodyJson.state
+      }
+      return json({ execution_request_id: executionRequestId, submission_state: binding.submissionState, provider_reference: binding.providerReference })
     }
 
     const finalizeMatch = path.match(/^\/operations\/([^/]+)\/finalize$/)

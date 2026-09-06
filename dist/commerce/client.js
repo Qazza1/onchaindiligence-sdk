@@ -467,17 +467,21 @@ export class CommerceOperation {
         const executionRequestId = this.record.executionRequestId;
         if (outcome.status === 'transaction-known') {
             await this.casUpdate({ transactionHash: outcome.transactionHash, localPhase: 'execution-complete' });
-            await this.updateBindingState(executionRequestId, 'transaction_known');
+            await this.updateBindingState(executionRequestId, 'transaction_known', outcome.providerReference);
             return { kind: 'execution-recorded', operationId: this.operationId, executionRequestId, transactionHash: outcome.transactionHash, providerReference: outcome.providerReference };
         }
         if (outcome.status === 'manual-recovery-required') {
             await this.casUpdate({ localPhase: 'manual-recovery-required' });
-            await this.updateBindingState(executionRequestId, 'manual_recovery_required');
+            await this.updateBindingState(executionRequestId, 'manual_recovery_required', outcome.providerReference);
             return { kind: 'manual-recovery-required', operationId: this.operationId, executionRequestId, reason: outcome.reason };
         }
         // submission-ambiguous
         await this.casUpdate({ localPhase: 'execution-ambiguous' });
-        await this.updateBindingState(executionRequestId, 'submission_ambiguous');
+        // D2.6 correction: attach providerReference here too, as soon as it's
+        // known -- an executor whose provider action happens in submit() (e.g.
+        // PayBox gateway mode) can learn its own request id well before a
+        // transaction is known. Never wait for transaction-known to correlate it.
+        await this.updateBindingState(executionRequestId, 'submission_ambiguous', outcome.providerReference);
         return pending(this.operationId, {
             phase: 'execution-ambiguous',
             safeNextAction: 'call op.execute() again -- it will call executor.resume(), never submit() a second time, for this execution',
@@ -486,12 +490,25 @@ export class CommerceOperation {
             executionRequestId,
         });
     }
-    async updateBindingState(executionRequestId, state) {
+    /**
+     * Best-effort mirror of the binding's submission_state and (D2.6
+     * correction) its provider_reference -- the LOCAL record + the binding's
+     * OWN prior state remain authoritative for resume logic either way.
+     * `providerReference` is attached server-side via the SAME one-way
+     * null -> value transition executionBinding.ts's attachProviderReference()
+     * enforces (idempotent on retry with the identical value, rejected on a
+     * genuine conflict) -- this call never fabricates a stronger correlation
+     * than what the executor itself reported.
+     */
+    async updateBindingState(executionRequestId, state, providerReference) {
+        const body = { state };
+        if (providerReference)
+            body.provider_reference = providerReference;
         await this.client
             .apiFetch(`/operations/${encodeURIComponent(this.operationId)}/execution-bindings/${encodeURIComponent(executionRequestId)}/state`, {
             method: 'POST',
             headers: { 'content-type': 'application/json', [RECOVERY_HEADER]: this.record.recoveryCredential },
-            body: JSON.stringify({ state }),
+            body: JSON.stringify(body),
         })
             .catch(() => { }); // best-effort mirror; the LOCAL record + the binding's OWN prior state remain authoritative for resume logic
     }

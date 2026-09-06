@@ -54,13 +54,27 @@ export type ExecutionOutcome = {
     status: 'transaction-known';
     transactionHash: string;
     providerReference?: string | null;
-} | {
+}
+/**
+ * D2.6 correction: `providerReference` may accompany a non-terminal
+ * outcome too, not only `transaction-known` — an executor whose provider
+ * action happens inside submit() (after the durable OCD execution binding
+ * already exists) can learn its own provider request id well before a
+ * transaction is known (e.g. PayBox gateway mode: the request id exists
+ * the moment useService() returns, even while status is still
+ * pending_approval). The orchestrator attaches it to the existing
+ * binding as soon as it's present, rather than waiting for
+ * transaction-known — see client.ts's applyExecutionOutcome().
+ */
+ | {
     status: 'submission-ambiguous';
     reason: string;
     retryAfterSeconds?: number;
+    providerReference?: string | null;
 } | {
     status: 'manual-recovery-required';
     reason: string;
+    providerReference?: string | null;
 };
 export type ExecutionResult = ExecutionOutcome & {
     clientSubmissionKey: string;

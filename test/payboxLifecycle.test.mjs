@@ -269,3 +269,71 @@ test('a terminal PayBox success with no readable x_payment output stops safely i
   assert.equal(resumed.status, 'manual-recovery-required', 'polling the same broken terminal response again must not become retryable-forever')
   assert.equal(paybox.payX402Calls.length, 1)
 })
+
+// --- D2.6 FINAL correction: prepare()/submit() boundary, real CommerceOperation flow ---
+
+const PAYER = '0x4D4cd7e2Ff500483c1ea4B2cFA68e1cf41F93846'
+const GATEWAY_ACTION = { ...ACTION, sender: PAYER }
+
+test('D2.6 FINAL #3: the OCD execution binding is durably registered BEFORE useService() can be called, in the real CommerceOperation flow', async () => {
+  const server = createFakeServer()
+  let bindingRegistered = false
+  const spyFetch = async (url, init) => {
+    const res = await server.fetch(url, init)
+    const pathname = new URL(url).pathname
+    if (/\/execution-bindings$/.test(pathname) && (init?.method || 'GET').toUpperCase() === 'POST' && res.ok) {
+      bindingRegistered = true
+    }
+    return res
+  }
+  const client = createCommerceClient({ recovery: new InMemoryRecoveryStore(), fetch: spyFetch })
+  const op = await client.open({ action: GATEWAY_ACTION, policy: POLICY })
+  assert.equal((await op.preflight()).kind, 'ready')
+  assert.equal(bindingRegistered, false, 'no binding should exist yet before execute() runs')
+
+  const paybox = new FakePayBoxClient()
+  const realUseService = paybox.useService.bind(paybox)
+  paybox.useService = async (input) => {
+    assert.equal(bindingRegistered, true, 'useService() must never be called before the OCD execution binding is registered')
+    return realUseService(input)
+  }
+  const executor = new PayBoxCommerceExecutor({
+    paybox,
+    credentialId: CREDENTIAL_ID,
+    store: new InMemoryPayBoxRequestStore(),
+    mode: 'gateway',
+    fetch: merchantFetch('0x' + 'cc'.repeat(32)),
+  })
+  const execution = await op.execute({ executor })
+  assert.equal(execution.kind, 'pending', 'FakePayBoxClient resolves gateway success immediately, but with no on-chain transfer added yet this must stay ambiguous, never fabricate success')
+  assert.equal(bindingRegistered, true)
+  assert.equal(paybox.useServiceCalls.length, 1)
+})
+
+test('D2.6 FINAL: provider_reference is attached to the execution binding as soon as useService() returns a request_id, even while the outcome is still pending', async () => {
+  const server = createFakeServer()
+  const client = createCommerceClient({ recovery: new InMemoryRecoveryStore(), fetch: server.fetch })
+  const op = await client.open({ action: GATEWAY_ACTION, policy: POLICY })
+  assert.equal((await op.preflight()).kind, 'ready')
+
+  const paybox = new FakePayBoxClient()
+  const executor = new PayBoxCommerceExecutor({
+    paybox,
+    credentialId: CREDENTIAL_ID,
+    store: new InMemoryPayBoxRequestStore(),
+    mode: 'gateway',
+    fetch: merchantFetch('0x' + 'dd'.repeat(32)),
+  })
+  const execution = await op.execute({ executor })
+  assert.equal(execution.kind, 'pending', 'no on-chain transfer added yet -- still ambiguous')
+
+  const binding = server.getExecutionBinding(execution.executionRequestId)
+  assert.ok(binding, 'execution binding must exist')
+  assert.equal(paybox.useServiceCalls.length, 1)
+  const [payboxRequestId] = [...paybox.requests.keys()]
+  assert.equal(
+    binding.providerReference,
+    `paybox:${payboxRequestId}`,
+    'provider_reference must already be attached even though the overall outcome is still pending, not only once transaction-known'
+  )
+})

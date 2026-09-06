@@ -386,6 +386,8 @@ interface PayBoxPreparedReference {
   asset: string
   atomicAmount: string
   recipient: string
+  /** gateway mode only: the expected on-chain payer, frozen at prepare() time from context.action.sender. */
+  expectedPayer?: string | null
 }
 
 export class PayBoxCommerceExecutor implements CommerceExecutor {
@@ -472,21 +474,32 @@ export class PayBoxCommerceExecutor implements CommerceExecutor {
     const atomicAmount = decimalToAtomic6(context.action.amount)
     validateChallenge(challenge, { network: context.action.network, asset: context.action.asset, amount: atomicAmount, recipient: context.action.recipient })
 
-    // Gateway mode: capture the search-window anchor BEFORE the atomic claim
-    // (read-only, no side effect, safe to redo on a retry) -- so a transient
-    // RPC hiccup here never leaves an ambiguous placeholder for a PayBox
-    // request that was never actually created.
-    let searchFromBlock: bigint | null = null
     if (this.mode === 'gateway') {
-      searchFromBlock = await this.baseLogClient().getBlockNumber()
+      // GATEWAY MODE IS READ-ONLY FROM HERE (D2.6 correction): no store
+      // write, no atomic claim, no useService() call. The orchestrator
+      // (client.ts) registers the durable OCD execution binding AFTER
+      // prepare() returns and BEFORE submit() is ever called -- the
+      // provider action must not be able to happen before that binding
+      // exists, so it moves to submit() (submitGateway()) entirely. This
+      // freezes exactly the inputs submit() needs; nothing here is a durable
+      // identity yet, so retrying prepare() itself is always trivially safe.
+      const reference: PayBoxPreparedReference = {
+        payboxRequestId: null,
+        resourceUrl: context.action.resource,
+        network: context.action.network,
+        asset: context.action.asset,
+        atomicAmount,
+        recipient: context.action.recipient,
+        expectedPayer: context.action.sender ?? null,
+      }
+      return { clientSubmissionKey: context.clientSubmissionKey, reference, preparedAt: new Date().toISOString(), providerReference: null }
     }
 
-    // D2.6 review fix #3: atomically claim the attempt slot for this
-    // clientSubmissionKey -- exactly one concurrent caller may proceed to
-    // call the provider action. A loser either reuses the winner's already-
-    // established request (if it finished first) or, if the winner is still
-    // in the ambiguous pre-request-id window, stops safely rather than
-    // racing to call the provider action itself.
+    // HEADER MODE: unchanged from before this correction -- pay_x402's
+    // durable identity is still established in prepare(). Preserved as-is
+    // (Section 8: "existing PayBox header behavior") since header mode is
+    // proven live incompatible with OneSource and this correction is scoped
+    // to the gateway flow's prepare()/submit() boundary specifically.
     const placeholder: PayBoxRequestRecord = {
       clientSubmissionKey: context.clientSubmissionKey,
       payboxRequestId: null,
@@ -498,50 +511,23 @@ export class PayBoxCommerceExecutor implements CommerceExecutor {
       transactionHash: null,
       mode: this.mode,
       expectedPayer: context.action.sender ?? null,
-      searchFromBlock: searchFromBlock !== null ? searchFromBlock.toString() : null,
-      // D2.6 correction: frozen NOW, alongside searchFromBlock -- never
-      // recomputed on resume, so the window can never expand indefinitely.
-      searchToBlock: searchFromBlock !== null ? (searchFromBlock + GATEWAY_SEARCH_WINDOW_BLOCKS).toString() : null,
     }
     const { claimed, record: claimedRecord } = await this.store.claim(context.clientSubmissionKey, placeholder)
     if (!claimed) {
       if (claimedRecord.payboxRequestId) {
-        // Another attempt already established (or is finishing establishing)
-        // a PayBox request for this exact key -- never call the provider
-        // action again.
         return this.toPrepareResult(context.clientSubmissionKey, claimedRecord)
       }
-      // The winner called the provider action but this process never
-      // learned the outcome (crash, or the winner is still in flight).
-      // Known, unavoidable crash window (see this file's header) -- surface
-      // it honestly rather than racing to call the provider ourselves.
       throw new PayBoxAmbiguousPrepareError(context.clientSubmissionKey)
     }
 
-    // We won the claim -- exactly this call may proceed to PayBox. This is
-    // PayBox's OWN independent grant/authorization check -- the provider
-    // action internally applies the credential's approval mode ("iframe" /
-    // "always_approve" / "autonomous" per docs.paybox.sh/concepts/model)
-    // before ever producing a signature.
-    let requestId: string
-    if (this.mode === 'gateway') {
-      const envelope = await this.paybox.useService!({
-        credential_id: this.credentialId,
-        url: context.action.resource,
-        method: 'GET',
-      })
-      requestId = envelope.request_id
-    } else {
-      const envelope = await this.paybox.payX402({
-        credential_id: this.credentialId,
-        accepts: (challenge as { accepts: unknown[] }).accepts,
-        resource_url: context.action.resource,
-        x402_version: (challenge as { x402Version?: 1 | 2 }).x402Version,
-      })
-      requestId = envelope.request_id
-    }
+    const envelope = await this.paybox.payX402({
+      credential_id: this.credentialId,
+      accepts: (challenge as { accepts: unknown[] }).accepts,
+      resource_url: context.action.resource,
+      x402_version: (challenge as { x402Version?: 1 | 2 }).x402Version,
+    })
 
-    const record: PayBoxRequestRecord = { ...claimedRecord, payboxRequestId: requestId }
+    const record: PayBoxRequestRecord = { ...claimedRecord, payboxRequestId: envelope.request_id }
     await this.store.set(record)
     return this.toPrepareResult(context.clientSubmissionKey, record)
   }
@@ -554,6 +540,7 @@ export class PayBoxCommerceExecutor implements CommerceExecutor {
       asset: record.asset,
       atomicAmount: record.atomicAmount,
       recipient: record.recipient,
+      expectedPayer: record.expectedPayer ?? null,
     }
     return {
       clientSubmissionKey,
@@ -567,7 +554,108 @@ export class PayBoxCommerceExecutor implements CommerceExecutor {
 
   async submit(prepared: PrepareResult): Promise<ExecutionResult> {
     const ref = prepared.reference as PayBoxPreparedReference
+    if (this.mode === 'gateway') {
+      return this.submitGateway(prepared.clientSubmissionKey, ref)
+    }
+    // header mode: the provider action already happened in prepare() (unchanged).
     return this.resolve(prepared.clientSubmissionKey, ref)
+  }
+
+  /**
+   * Gateway mode's ENTIRE state-changing action (D2.6 correction). Called by
+   * the orchestrator only after the durable OCD execution binding already
+   * exists (client.ts's executeLocked() registers it between prepare() and
+   * submit()) -- so by the time useService() can possibly run, OCD already
+   * has a durable row to resume from.
+   *
+   * Atomically claims the submission slot itself (the SAME
+   * PayBoxRequestStore.claim() mechanism prepare() used to use): exactly one
+   * concurrent `submit()` call (e.g. two racing processes that both reached
+   * the "register a new binding" branch) may proceed to call useService().
+   * The search window's bounds are frozen HERE, immediately before the one
+   * useService() call -- tied to the actual provider submission attempt,
+   * never to whenever prepare() happened to run (Section 6).
+   */
+  private async submitGateway(clientSubmissionKey: string, ref: PayBoxPreparedReference): Promise<ExecutionResult> {
+    const existing = await this.store.get(clientSubmissionKey)
+    if (existing?.payboxRequestId) {
+      // Another submit() call already established (or is finishing
+      // establishing) the PayBox request for this exact key -- never call
+      // useService() again; just resolve/poll the existing one.
+      return this.resolve(clientSubmissionKey, this.refFromRecord(existing))
+    }
+    if (existing && !existing.payboxRequestId) {
+      // Another submit() call won the claim and is either still in flight or
+      // crashed before ever learning the request_id. Known, unavoidable
+      // crash window -- honest ambiguity, never a guess, never a second
+      // useService() call. This is a normal ExecutionResult (not a thrown
+      // exception): the OCD execution binding already exists at this point,
+      // so applyExecutionOutcome() must run to mirror this state onto it.
+      return {
+        clientSubmissionKey,
+        status: 'manual-recovery-required',
+        reason: `a prior submit() for clientSubmissionKey "${clientSubmissionKey}" called PayBox's useService() but this process never learned whether PayBox created a request -- useService has no idempotency key, so calling it again here could create a SECOND PayBox request for the same intended payment. Check PayBox directly (dashboard or "paybox request --list") for an orphaned request tied to this payment before retrying.`,
+      }
+    }
+
+    // Read-only, no side effect, safe to redo on a retry -- frozen NOW,
+    // immediately before the claim, so the window is anchored to the actual
+    // submission attempt rather than to whenever prepare() ran.
+    const searchFromBlock = await this.baseLogClient().getBlockNumber()
+    const searchToBlock = searchFromBlock + GATEWAY_SEARCH_WINDOW_BLOCKS
+
+    const placeholder: PayBoxRequestRecord = {
+      clientSubmissionKey,
+      payboxRequestId: null,
+      resourceUrl: ref.resourceUrl,
+      network: ref.network,
+      asset: ref.asset,
+      atomicAmount: ref.atomicAmount,
+      recipient: ref.recipient,
+      transactionHash: null,
+      mode: 'gateway',
+      expectedPayer: ref.expectedPayer ?? null,
+      searchFromBlock: searchFromBlock.toString(),
+      searchToBlock: searchToBlock.toString(),
+    }
+    const { claimed, record: claimedRecord } = await this.store.claim(clientSubmissionKey, placeholder)
+    if (!claimed) {
+      if (claimedRecord.payboxRequestId) {
+        return this.resolve(clientSubmissionKey, this.refFromRecord(claimedRecord))
+      }
+      return {
+        clientSubmissionKey,
+        status: 'manual-recovery-required',
+        reason: `a concurrent submit() for clientSubmissionKey "${clientSubmissionKey}" already claimed this attempt but has not yet recorded a PayBox request_id -- check PayBox directly before retrying`,
+      }
+    }
+
+    // We won the claim -- exactly this call may proceed to PayBox. This is
+    // PayBox's OWN independent grant/authorization check -- useService()
+    // internally applies the credential's approval mode ("iframe" /
+    // "always_approve" / "autonomous" per docs.paybox.sh/concepts/model)
+    // before ever producing a signature, and negotiates the merchant's
+    // challenge itself.
+    const envelope = await this.paybox.useService!({ credential_id: this.credentialId, url: ref.resourceUrl, method: 'GET' })
+
+    // Persist the request_id FIRST, before anything else -- this is the
+    // durable identity resume()/future submitGateway() calls key off of.
+    const record: PayBoxRequestRecord = { ...claimedRecord, payboxRequestId: envelope.request_id }
+    await this.store.set(record)
+
+    return this.resolve(clientSubmissionKey, this.refFromRecord(record))
+  }
+
+  private refFromRecord(record: PayBoxRequestRecord): PayBoxPreparedReference {
+    return {
+      payboxRequestId: record.payboxRequestId,
+      resourceUrl: record.resourceUrl,
+      network: record.network,
+      asset: record.asset,
+      atomicAmount: record.atomicAmount,
+      recipient: record.recipient,
+      expectedPayer: record.expectedPayer ?? null,
+    }
   }
 
   async resume(prepared: PrepareResult, priorOutcome?: ExecutionResult): Promise<ExecutionResult> {
@@ -597,14 +685,7 @@ export class PayBoxCommerceExecutor implements CommerceExecutor {
         reason: 'no PayBox request is on record for this submission attempt -- check PayBox directly (dashboard or CLI) before retrying',
       }
     }
-    return this.resolve(prepared.clientSubmissionKey, {
-      payboxRequestId: record.payboxRequestId,
-      resourceUrl: record.resourceUrl,
-      network: record.network,
-      asset: record.asset,
-      atomicAmount: record.atomicAmount,
-      recipient: record.recipient,
-    })
+    return this.resolve(prepared.clientSubmissionKey, this.refFromRecord(record))
   }
 
   /**
@@ -626,6 +707,11 @@ export class PayBoxCommerceExecutor implements CommerceExecutor {
     if (!ref.payboxRequestId) {
       return { clientSubmissionKey, status: 'manual-recovery-required', reason: 'no PayBox request_id is available for this submission attempt' }
     }
+    // D2.6 correction (Section 5): known from THIS point on -- attach it to
+    // every subsequent outcome below, not only transaction-known, so the
+    // orchestrator can correlate it to the OCD execution binding as soon as
+    // it exists, regardless of whether PayBox is still pending.
+    const providerReference = `paybox:${ref.payboxRequestId}`
 
     let envelope: PayBoxRequestEnvelope
     try {
@@ -634,7 +720,7 @@ export class PayBoxCommerceExecutor implements CommerceExecutor {
       // get_request is a read-only status check -- a failure here is
       // ambiguous about PayBox's OWN reachability, never about whether the
       // request itself changed state. Safe to just try again later.
-      return { clientSubmissionKey, status: 'submission-ambiguous', reason: `could not reach PayBox to check request ${ref.payboxRequestId}: ${err?.message || 'no response'}`, retryAfterSeconds: 5 }
+      return { clientSubmissionKey, status: 'submission-ambiguous', reason: `could not reach PayBox to check request ${ref.payboxRequestId}: ${err?.message || 'no response'}`, retryAfterSeconds: 5, providerReference }
     }
 
     if (envelope.status === 'pending_approval' || envelope.status === 'pending_signature') {
@@ -643,6 +729,7 @@ export class PayBoxCommerceExecutor implements CommerceExecutor {
         status: 'submission-ambiguous',
         reason: `PayBox request ${ref.payboxRequestId} is ${envelope.status} -- poll again, do not resubmit`,
         retryAfterSeconds: envelope.status === 'pending_approval' ? 15 : 5,
+        providerReference,
       }
     }
     if (envelope.status === 'denied') {
@@ -657,6 +744,7 @@ export class PayBoxCommerceExecutor implements CommerceExecutor {
         clientSubmissionKey,
         status: 'manual-recovery-required',
         reason: `PayBox denied request ${ref.payboxRequestId}${envelope.reason ? `: ${envelope.reason}` : ''} -- no merchant payment was made`,
+        providerReference,
       }
     }
     if (envelope.status === 'error') {
@@ -669,6 +757,7 @@ export class PayBoxCommerceExecutor implements CommerceExecutor {
         clientSubmissionKey,
         status: 'manual-recovery-required',
         reason: `PayBox reported a terminal error for request ${ref.payboxRequestId}${envelope.message ? `: ${envelope.message}` : ''} -- no merchant payment was made; this request will not resolve differently on retry`,
+        providerReference,
       }
     }
 
@@ -694,6 +783,7 @@ export class PayBoxCommerceExecutor implements CommerceExecutor {
         clientSubmissionKey,
         status: 'manual-recovery-required',
         reason: `PayBox request ${ref.payboxRequestId} reached terminal status "success" but no x_payment header could be read from its output -- check PayBox directly before retrying`,
+        providerReference: `paybox:${ref.payboxRequestId}`,
       }
     }
     return this.presentPaymentToMerchant(clientSubmissionKey, ref, xPayment)
@@ -722,11 +812,12 @@ export class PayBoxCommerceExecutor implements CommerceExecutor {
     ref: PayBoxPreparedReference,
     xPayment: { header: string; value: string }
   ): Promise<ExecutionResult> {
+    const providerReference = `paybox:${ref.payboxRequestId}`
     let res: Response
     try {
       res = await this.fetchImpl(ref.resourceUrl, { headers: { [xPayment.header]: xPayment.value } })
     } catch (err: any) {
-      return { clientSubmissionKey, status: 'submission-ambiguous', reason: err?.message || 'no response from the resource after presenting the PayBox-signed payment', retryAfterSeconds: 5 }
+      return { clientSubmissionKey, status: 'submission-ambiguous', reason: err?.message || 'no response from the resource after presenting the PayBox-signed payment', retryAfterSeconds: 5, providerReference }
     }
     if (res.status === 402) {
       let versionMismatch: number | undefined
@@ -741,16 +832,17 @@ export class PayBoxCommerceExecutor implements CommerceExecutor {
           clientSubmissionKey,
           status: 'manual-recovery-required',
           reason: `PayBox request ${ref.payboxRequestId}'s header-mode payment was rejected (still 402) and the merchant's challenge advertises x402Version 2 -- PayBox's header-mode output is not compatible with an x402 v2 merchant for this resource. No merchant transaction occurred. Use mode: 'gateway' (useService) for this merchant instead; this request will not resolve differently on retry.`,
+          providerReference,
         }
       }
-      return { clientSubmissionKey, status: 'submission-ambiguous', reason: `resource still returned 402 after presenting the PayBox-signed payment (status ${res.status})` }
+      return { clientSubmissionKey, status: 'submission-ambiguous', reason: `resource still returned 402 after presenting the PayBox-signed payment (status ${res.status})`, providerReference }
     }
     if (!res.ok) {
-      return { clientSubmissionKey, status: 'submission-ambiguous', reason: `resource returned HTTP ${res.status} after presenting the PayBox-signed payment -- outcome unknown` }
+      return { clientSubmissionKey, status: 'submission-ambiguous', reason: `resource returned HTTP ${res.status} after presenting the PayBox-signed payment -- outcome unknown`, providerReference }
     }
     const { transactionHash } = decodeSettlementResponse(res)
     if (!transactionHash) {
-      return { clientSubmissionKey, status: 'submission-ambiguous', reason: 'resource responded successfully but no transaction hash could be parsed from the settlement response' }
+      return { clientSubmissionKey, status: 'submission-ambiguous', reason: 'resource responded successfully but no transaction hash could be parsed from the settlement response', providerReference }
     }
 
     // Durable BEFORE returning -- resolve() must never re-present this
@@ -791,6 +883,7 @@ export class PayBoxCommerceExecutor implements CommerceExecutor {
         clientSubmissionKey,
         status: 'manual-recovery-required',
         reason: `PayBox gateway request ${ref.payboxRequestId} reported "success" but its payment/resource result failed validation (gateway=${payment?.gateway}, payment.status=${payment?.status}, payment.ok=${payment?.ok}, payment.network=${payment?.network}, payment.scheme=${payment?.scheme}, resource.status=${resourceResponse?.status}, resource.ok=${resourceResponse?.ok}) -- treating a malformed/inconsistent success as unpaid rather than guessing`,
+        providerReference: `paybox:${ref.payboxRequestId}`,
       }
     }
 
@@ -841,6 +934,7 @@ export class PayBoxCommerceExecutor implements CommerceExecutor {
         clientSubmissionKey,
         status: 'manual-recovery-required',
         reason: `PayBox gateway request ${ref.payboxRequestId} succeeded but no expectedPayer is on record to search for the settlement transfer -- this should not happen for a request created by this version of the adapter; check PayBox and Base directly`,
+        providerReference: `paybox:${ref.payboxRequestId}`,
       }
     }
 
@@ -851,15 +945,22 @@ export class PayBoxCommerceExecutor implements CommerceExecutor {
     // silently recomputing (and therefore drifting) on every call.
     const frozenToBlock = record.searchToBlock ? BigInt(record.searchToBlock) : fromBlock + GATEWAY_SEARCH_WINDOW_BLOCKS
     if (!record.searchToBlock) {
-      await this.store.set({ ...record, searchToBlock: frozenToBlock.toString() })
+      // D2.6 correction (Section 7): reassign `record` itself, not just the
+      // durable row -- every subsequent store.set() in this method spreads
+      // `...record`, and without this reassignment the fallback searchToBlock
+      // just persisted would be silently dropped by the NEXT write (e.g. the
+      // one that stores transactionHash below), reverting to undefined.
+      record = { ...record, searchToBlock: frozenToBlock.toString() }
+      await this.store.set(record)
     }
 
+    const providerReference = `paybox:${ref.payboxRequestId}`
     const client = this.baseLogClient()
     let chainHead: bigint
     try {
       chainHead = await client.getBlockNumber()
     } catch (err: any) {
-      return { clientSubmissionKey, status: 'submission-ambiguous', reason: `could not reach Base to search for the settlement transfer: ${err?.message || 'no response'}`, retryAfterSeconds: 10 }
+      return { clientSubmissionKey, status: 'submission-ambiguous', reason: `could not reach Base to search for the settlement transfer: ${err?.message || 'no response'}`, retryAfterSeconds: 10, providerReference }
     }
 
     // Never query past the frozen upper bound, even if the chain has moved
@@ -877,7 +978,7 @@ export class PayBoxCommerceExecutor implements CommerceExecutor {
         toBlock: effectiveToBlock,
       })
     } catch (err: any) {
-      return { clientSubmissionKey, status: 'submission-ambiguous', reason: `Base log search failed: ${err?.message || 'no response'}`, retryAfterSeconds: 10 }
+      return { clientSubmissionKey, status: 'submission-ambiguous', reason: `Base log search failed: ${err?.message || 'no response'}`, retryAfterSeconds: 10, providerReference }
     }
 
     const expectedAmount = BigInt(ref.atomicAmount)
@@ -892,6 +993,7 @@ export class PayBoxCommerceExecutor implements CommerceExecutor {
           clientSubmissionKey,
           status: 'manual-recovery-required',
           reason: `PayBox gateway request ${ref.payboxRequestId} succeeded but no matching on-chain USDC transfer (payer ${record.expectedPayer} -> recipient ${ref.recipient}, ${ref.atomicAmount} atomic) was found in the full search window (blocks ${fromBlock}-${frozenToBlock}) -- the window is now exhausted; this will not resolve differently on retry`,
+          providerReference,
         }
       }
       return {
@@ -899,6 +1001,7 @@ export class PayBoxCommerceExecutor implements CommerceExecutor {
         status: 'submission-ambiguous',
         reason: `PayBox gateway execution succeeded but no matching on-chain USDC transfer (payer ${record.expectedPayer} -> recipient ${ref.recipient}, ${ref.atomicAmount} atomic) has been observed yet in blocks ${fromBlock}-${effectiveToBlock} (window open through ${frozenToBlock}) -- may still be settling`,
         retryAfterSeconds: 10,
+        providerReference,
       }
     }
     if (exact.length > 1) {
@@ -907,6 +1010,7 @@ export class PayBoxCommerceExecutor implements CommerceExecutor {
         clientSubmissionKey,
         status: 'manual-recovery-required',
         reason: `found ${exact.length} exactly-matching USDC transfers (payer ${record.expectedPayer} -> recipient ${ref.recipient}, ${ref.atomicAmount} atomic) in blocks ${fromBlock}-${effectiveToBlock} for PayBox gateway request ${ref.payboxRequestId} -- cannot uniquely identify the settlement transaction`,
+        providerReference,
       }
     }
 
