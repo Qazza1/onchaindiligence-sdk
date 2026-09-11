@@ -76,8 +76,19 @@ export type ExecutionOutcome = {
     reason: string;
     providerReference?: string | null;
 };
+/**
+ * A safe, terminal provider-result snapshot that an executor may hand to the
+ * existing OCD provider-evidence endpoint. It is a provider claim only: the
+ * orchestration layer must never use it as a settlement observation.
+ */
+export interface ProviderEvidenceSubmission {
+    provider: 'paybox';
+    providerVersion: string;
+    payload: Record<string, unknown>;
+}
 export type ExecutionResult = ExecutionOutcome & {
     clientSubmissionKey: string;
+    providerEvidence?: ProviderEvidenceSubmission;
 };
 export interface CommerceExecutor {
     readonly id: string;

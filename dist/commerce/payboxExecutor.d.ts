@@ -258,6 +258,13 @@ export declare class PayBoxCommerceExecutor implements CommerceExecutor {
      */
     private submitGateway;
     private refFromRecord;
+    /**
+     * Builds the C1/C2 provider-evidence payload from PayBox's actual terminal
+     * response shape. It deliberately retains only documented non-secret
+     * metadata; it never forwards payment authorizations, headers, body data,
+     * credentials, or an inferred transaction hash.
+     */
+    private providerEvidence;
     resume(prepared: PrepareResult, priorOutcome?: ExecutionResult): Promise<ExecutionResult>;
     /**
      * Shared by submit() (first check, right after prepare()) and resume()

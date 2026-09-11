@@ -15,7 +15,7 @@
  * it is.
  */
 import type { CommerceAction, CommercePolicy, CommercePublication, OperationStatus, ReceiptEnvelope, PreflightResponseBody, ApiErrorBody, OperationFinalizeResponseBody } from './types.js'
-import type { CommerceExecutor, PrepareResult, ExecutionResult, ExecutorRecoveryMode } from './executor.js'
+import type { CommerceExecutor, PrepareResult, ExecutionResult, ExecutorRecoveryMode, ProviderEvidenceSubmission } from './executor.js'
 import type { CommerceRecoveryStore, CommerceRecoveryRecord } from './recoveryStore.js'
 import { VersionConflictError } from './recoveryStore.js'
 import { type PreflightEvaluation, type ExecutionRecord, type FinalizeResult, type ResumeResult, pending } from './results.js'
@@ -634,6 +634,7 @@ export class CommerceOperation {
           })
         }
       }
+      await this.recordProviderEvidenceBestEffort(executionRequestId, outcome.providerEvidence)
       await this.casUpdate({ transactionHash: outcome.transactionHash, localPhase: 'execution-complete' })
       await this.updateBindingState(executionRequestId, 'transaction_known')
       return { kind: 'execution-recorded', operationId: this.operationId, executionRequestId, transactionHash: outcome.transactionHash, providerReference: outcome.providerReference }
@@ -642,6 +643,7 @@ export class CommerceOperation {
     if (outcome.status === 'manual-recovery-required') {
       await this.casUpdate({ localPhase: 'manual-recovery-required' })
       if (outcome.providerReference) await this.attachProviderReferenceBestEffort(executionRequestId, outcome.providerReference)
+      await this.recordProviderEvidenceBestEffort(executionRequestId, outcome.providerEvidence)
       await this.updateBindingState(executionRequestId, 'manual_recovery_required')
       return { kind: 'manual-recovery-required', operationId: this.operationId, executionRequestId, reason: outcome.reason }
     }
@@ -649,6 +651,7 @@ export class CommerceOperation {
     // submission-ambiguous
     await this.casUpdate({ localPhase: 'execution-ambiguous' })
     if (outcome.providerReference) await this.attachProviderReferenceBestEffort(executionRequestId, outcome.providerReference)
+    await this.recordProviderEvidenceBestEffort(executionRequestId, outcome.providerEvidence)
     await this.updateBindingState(executionRequestId, 'submission_ambiguous')
     return pending(this.operationId, {
       phase: 'execution-ambiguous',
@@ -657,6 +660,28 @@ export class CommerceOperation {
       mayAlreadyHavePaid: true,
       executionRequestId,
     })
+  }
+
+  /**
+   * Provider evidence is an append-only, best-effort audit claim. It must not
+   * change execution, finalization, or settlement behavior if OCD is
+   * temporarily unavailable. The C2 endpoint verifies the durable PayBox
+   * request binding before accepting it; retries of the same terminal
+   * provider snapshot are content-idempotent server-side.
+   */
+  private async recordProviderEvidenceBestEffort(executionRequestId: string, claim?: ProviderEvidenceSubmission): Promise<void> {
+    if (!claim || claim.provider !== 'paybox') return
+    await this.client
+      .apiFetch(`/operations/${encodeURIComponent(this.operationId)}/provider-evidence`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', [RECOVERY_HEADER]: this.record.recoveryCredential },
+        body: JSON.stringify({
+          provider_version: claim.providerVersion,
+          execution_request_id: executionRequestId,
+          paybox_response: claim.payload,
+        }),
+      })
+      .catch(() => {})
   }
 
   /**

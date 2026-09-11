@@ -191,6 +191,14 @@ export declare class CommerceOperation {
      */
     private applyExecutionOutcome;
     /**
+     * Provider evidence is an append-only, best-effort audit claim. It must not
+     * change execution, finalization, or settlement behavior if OCD is
+     * temporarily unavailable. The C2 endpoint verifies the durable PayBox
+     * request binding before accepting it; retries of the same terminal
+     * provider snapshot are content-idempotent server-side.
+     */
+    private recordProviderEvidenceBestEffort;
+    /**
      * D2.6 correction: strictly attaches `providerReference` to the ALREADY-
      * EXISTING execution binding via the SAME state endpoint the submission-
      * state mirror uses -- makes NO new execution binding, performs NO

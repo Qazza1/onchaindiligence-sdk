@@ -429,6 +429,34 @@ export class PayBoxCommerceExecutor {
             expectedPayer: record.expectedPayer ?? null,
         };
     }
+    /**
+     * Builds the C1/C2 provider-evidence payload from PayBox's actual terminal
+     * response shape. It deliberately retains only documented non-secret
+     * metadata; it never forwards payment authorizations, headers, body data,
+     * credentials, or an inferred transaction hash.
+     */
+    providerEvidence(envelope) {
+        const payment = envelope.output?.value?.payment;
+        const response = envelope.output?.value?.response;
+        return {
+            provider: 'paybox',
+            providerVersion: this.version,
+            payload: {
+                request_id: envelope.request_id,
+                status: envelope.status,
+                output_id: envelope.output_id ?? null,
+                audit_id: envelope.audit_id ?? null,
+                payment: payment ? {
+                    gateway: payment.gateway === true,
+                    status: payment.status ?? null,
+                    ok: payment.ok === true,
+                    network: payment.network ?? null,
+                    scheme: payment.scheme ?? null,
+                } : null,
+                response: response ? { status: response.status ?? null, ok: response.ok === true } : null,
+            },
+        };
+    }
     async resume(prepared, priorOutcome) {
         // Mirrors X402BaseUsdcExecutor's own resume(): if a transaction hash is
         // ALREADY known from a prior call, independently re-confirm it read-only
@@ -514,6 +542,7 @@ export class PayBoxCommerceExecutor {
                 status: 'manual-recovery-required',
                 reason: `PayBox denied request ${ref.payboxRequestId}${envelope.reason ? `: ${envelope.reason}` : ''} -- no merchant payment was made`,
                 providerReference,
+                providerEvidence: this.providerEvidence(envelope),
             };
         }
         if (envelope.status === 'error') {
@@ -527,20 +556,21 @@ export class PayBoxCommerceExecutor {
                 status: 'manual-recovery-required',
                 reason: `PayBox reported a terminal error for request ${ref.payboxRequestId}${envelope.message ? `: ${envelope.message}` : ''} -- no merchant payment was made; this request will not resolve differently on retry`,
                 providerReference,
+                providerEvidence: this.providerEvidence(envelope),
             };
         }
         // status === 'success': dispatch on the RECORD's own mode -- see modeOf().
         if (this.modeOf(record) === 'gateway') {
-            return this.resolveGatewaySuccess(clientSubmissionKey, ref, envelope, record);
+            return this.resolveGatewaySuccess(clientSubmissionKey, ref, envelope, record, this.providerEvidence(envelope));
         }
-        return this.resolveHeaderSuccess(clientSubmissionKey, ref, envelope);
+        return this.resolveHeaderSuccess(clientSubmissionKey, ref, envelope, this.providerEvidence(envelope));
     }
     /**
      * header mode: PayBox signed the payment but did NOT submit it to the
      * merchant -- presenting it is this adapter's job, exactly like
      * X402BaseUsdcExecutor.submit()'s own post-signing half.
      */
-    async resolveHeaderSuccess(clientSubmissionKey, ref, envelope) {
+    async resolveHeaderSuccess(clientSubmissionKey, ref, envelope, providerEvidence) {
         const xPayment = envelope.output?.value?.x_payment;
         if (!xPayment?.header || !xPayment?.value) {
             // `success` is ALSO terminal (per docs) -- polling get_request again
@@ -551,9 +581,11 @@ export class PayBoxCommerceExecutor {
                 status: 'manual-recovery-required',
                 reason: `PayBox request ${ref.payboxRequestId} reached terminal status "success" but no x_payment header could be read from its output -- check PayBox directly before retrying`,
                 providerReference: `paybox:${ref.payboxRequestId}`,
+                providerEvidence,
             };
         }
-        return this.presentPaymentToMerchant(clientSubmissionKey, ref, xPayment);
+        const outcome = await this.presentPaymentToMerchant(clientSubmissionKey, ref, xPayment);
+        return { ...outcome, providerEvidence };
     }
     /**
      * Attaches the PayBox-signed x402 payment header and calls the merchant
@@ -621,7 +653,7 @@ export class PayBoxCommerceExecutor {
      * non-secret metadata, then recover the transaction identity conservatively
      * (requirement 4) -- never from balance-delta, never by guessing.
      */
-    async resolveGatewaySuccess(clientSubmissionKey, ref, envelope, record) {
+    async resolveGatewaySuccess(clientSubmissionKey, ref, envelope, record, providerEvidence) {
         const payment = envelope.output?.value?.payment;
         const resourceResponse = envelope.output?.value?.response;
         const valid = payment?.gateway === true &&
@@ -640,6 +672,7 @@ export class PayBoxCommerceExecutor {
                 status: 'manual-recovery-required',
                 reason: `PayBox gateway request ${ref.payboxRequestId} reported "success" but its payment/resource result failed validation (gateway=${payment?.gateway}, payment.status=${payment?.status}, payment.ok=${payment?.ok}, payment.network=${payment?.network}, payment.scheme=${payment?.scheme}, resource.status=${resourceResponse?.status}, resource.ok=${resourceResponse?.ok}) -- treating a malformed/inconsistent success as unpaid rather than guessing`,
                 providerReference: `paybox:${ref.payboxRequestId}`,
+                providerEvidence,
             };
         }
         // Persist non-secret provider metadata -- never a signature/authorization value.
@@ -649,7 +682,8 @@ export class PayBoxCommerceExecutor {
             auditId: envelope.audit_id ?? null,
             resourceStatus: resourceResponse.status ?? null,
         });
-        return this.discoverTransaction(clientSubmissionKey, ref, { ...record, outputId: envelope.output_id ?? null, auditId: envelope.audit_id ?? null, resourceStatus: resourceResponse.status ?? null });
+        const outcome = await this.discoverTransaction(clientSubmissionKey, ref, { ...record, outputId: envelope.output_id ?? null, auditId: envelope.audit_id ?? null, resourceStatus: resourceResponse.status ?? null });
+        return { ...outcome, providerEvidence };
     }
     /**
      * Conservative transaction-identity recovery (requirement 4): PayBox's

@@ -63,7 +63,18 @@ export type ExecutionOutcome =
   | { status: 'submission-ambiguous'; reason: string; retryAfterSeconds?: number; providerReference?: string | null }
   | { status: 'manual-recovery-required'; reason: string; providerReference?: string | null }
 
-export type ExecutionResult = ExecutionOutcome & { clientSubmissionKey: string }
+/**
+ * A safe, terminal provider-result snapshot that an executor may hand to the
+ * existing OCD provider-evidence endpoint. It is a provider claim only: the
+ * orchestration layer must never use it as a settlement observation.
+ */
+export interface ProviderEvidenceSubmission {
+  provider: 'paybox'
+  providerVersion: string
+  payload: Record<string, unknown>
+}
+
+export type ExecutionResult = ExecutionOutcome & { clientSubmissionKey: string; providerEvidence?: ProviderEvidenceSubmission }
 
 export interface CommerceExecutor {
   readonly id: string

@@ -386,9 +386,10 @@ function gatewayExecutorWithMatchingTransfer({ paybox = new FakePayBoxClient(), 
   return { paybox, store, baseReadClient, executor }
 }
 
-test('D2.6 durability #1/#9: provider_reference attaches BEFORE local transactionHash becomes terminal; a successful attachment lets transaction-known proceed normally', async () => {
+test('D2.6 durability / D3.4C2: provider_reference attaches before local terminal state and the terminal PayBox claim is recorded without fabricating a transaction hash', async () => {
   const server = createFakeServer()
   let sawTransactionHashDuringAttach
+  let payboxClaim
   let op
   const spyFetch = async (url, init) => {
     const pathname = new URL(url).pathname
@@ -397,6 +398,10 @@ test('D2.6 durability #1/#9: provider_reference attaches BEFORE local transactio
       if (body.provider_reference !== undefined && body.state === undefined) {
         sawTransactionHashDuringAttach = op.currentRecord().transactionHash
       }
+    }
+    if (/\/provider-evidence$/.test(pathname) && init?.body) {
+      payboxClaim = JSON.parse(init.body)
+      return new Response(JSON.stringify({ evidence_id: 'sha256:provider-claim' }), { status: 201, headers: { 'content-type': 'application/json' } })
     }
     return server.fetch(url, init)
   }
@@ -410,6 +415,10 @@ test('D2.6 durability #1/#9: provider_reference attaches BEFORE local transactio
   assert.equal(sawTransactionHashDuringAttach, null, 'transactionHash must still be null in the local record at the moment the attach call is made')
   assert.equal(execution.kind, 'execution-recorded', 'a successful attachment must let transaction-known proceed exactly as before')
   assert.equal(op.currentRecord().transactionHash, execution.transactionHash)
+  assert.equal(payboxClaim.provider_version, 'v1-gateway')
+  assert.equal(payboxClaim.paybox_response.status, 'success')
+  assert.equal(payboxClaim.paybox_response.payment.network, 'eip155:8453')
+  assert.equal(payboxClaim.paybox_response.transaction_hash, undefined, 'the SDK must not fabricate a PayBox transaction hash')
 })
 
 test('D2.6 durability #2/#3/#4: a transient provider-reference attach failure does not make the execution permanently terminal, uses the same request_id, and never calls useService twice', async () => {

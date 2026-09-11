@@ -128,7 +128,7 @@
  */
 import { createPublicClient, http, parseAbiItem } from 'viem'
 import { base } from 'viem/chains'
-import type { CommerceExecutor, PrepareContext, PrepareResult, ExecutionResult, ExecutorRecoveryMode } from './executor.js'
+import type { CommerceExecutor, PrepareContext, PrepareResult, ExecutionResult, ExecutorRecoveryMode, ProviderEvidenceSubmission } from './executor.js'
 import { BASE_NETWORK, BASE_USDC, type MinimalResumeClient } from './x402Executor.js'
 import { X402ChallengeError, decodeChallenge, validateChallenge, decodeSettlementResponse, decimalToAtomic6 } from './x402Challenge.js'
 
@@ -658,6 +658,35 @@ export class PayBoxCommerceExecutor implements CommerceExecutor {
     }
   }
 
+  /**
+   * Builds the C1/C2 provider-evidence payload from PayBox's actual terminal
+   * response shape. It deliberately retains only documented non-secret
+   * metadata; it never forwards payment authorizations, headers, body data,
+   * credentials, or an inferred transaction hash.
+   */
+  private providerEvidence(envelope: PayBoxRequestEnvelope): ProviderEvidenceSubmission {
+    const payment = envelope.output?.value?.payment
+    const response = envelope.output?.value?.response
+    return {
+      provider: 'paybox',
+      providerVersion: this.version,
+      payload: {
+        request_id: envelope.request_id,
+        status: envelope.status,
+        output_id: envelope.output_id ?? null,
+        audit_id: envelope.audit_id ?? null,
+        payment: payment ? {
+          gateway: payment.gateway === true,
+          status: payment.status ?? null,
+          ok: payment.ok === true,
+          network: payment.network ?? null,
+          scheme: payment.scheme ?? null,
+        } : null,
+        response: response ? { status: response.status ?? null, ok: response.ok === true } : null,
+      },
+    }
+  }
+
   async resume(prepared: PrepareResult, priorOutcome?: ExecutionResult): Promise<ExecutionResult> {
     // Mirrors X402BaseUsdcExecutor's own resume(): if a transaction hash is
     // ALREADY known from a prior call, independently re-confirm it read-only
@@ -745,6 +774,7 @@ export class PayBoxCommerceExecutor implements CommerceExecutor {
         status: 'manual-recovery-required',
         reason: `PayBox denied request ${ref.payboxRequestId}${envelope.reason ? `: ${envelope.reason}` : ''} -- no merchant payment was made`,
         providerReference,
+        providerEvidence: this.providerEvidence(envelope),
       }
     }
     if (envelope.status === 'error') {
@@ -758,14 +788,15 @@ export class PayBoxCommerceExecutor implements CommerceExecutor {
         status: 'manual-recovery-required',
         reason: `PayBox reported a terminal error for request ${ref.payboxRequestId}${envelope.message ? `: ${envelope.message}` : ''} -- no merchant payment was made; this request will not resolve differently on retry`,
         providerReference,
+        providerEvidence: this.providerEvidence(envelope),
       }
     }
 
     // status === 'success': dispatch on the RECORD's own mode -- see modeOf().
     if (this.modeOf(record) === 'gateway') {
-      return this.resolveGatewaySuccess(clientSubmissionKey, ref, envelope, record!)
+      return this.resolveGatewaySuccess(clientSubmissionKey, ref, envelope, record!, this.providerEvidence(envelope))
     }
-    return this.resolveHeaderSuccess(clientSubmissionKey, ref, envelope)
+    return this.resolveHeaderSuccess(clientSubmissionKey, ref, envelope, this.providerEvidence(envelope))
   }
 
   /**
@@ -773,7 +804,7 @@ export class PayBoxCommerceExecutor implements CommerceExecutor {
    * merchant -- presenting it is this adapter's job, exactly like
    * X402BaseUsdcExecutor.submit()'s own post-signing half.
    */
-  private async resolveHeaderSuccess(clientSubmissionKey: string, ref: PayBoxPreparedReference, envelope: PayBoxRequestEnvelope): Promise<ExecutionResult> {
+  private async resolveHeaderSuccess(clientSubmissionKey: string, ref: PayBoxPreparedReference, envelope: PayBoxRequestEnvelope, providerEvidence: ProviderEvidenceSubmission): Promise<ExecutionResult> {
     const xPayment = envelope.output?.value?.x_payment
     if (!xPayment?.header || !xPayment?.value) {
       // `success` is ALSO terminal (per docs) -- polling get_request again
@@ -784,9 +815,11 @@ export class PayBoxCommerceExecutor implements CommerceExecutor {
         status: 'manual-recovery-required',
         reason: `PayBox request ${ref.payboxRequestId} reached terminal status "success" but no x_payment header could be read from its output -- check PayBox directly before retrying`,
         providerReference: `paybox:${ref.payboxRequestId}`,
+        providerEvidence,
       }
     }
-    return this.presentPaymentToMerchant(clientSubmissionKey, ref, xPayment)
+    const outcome = await this.presentPaymentToMerchant(clientSubmissionKey, ref, xPayment)
+    return { ...outcome, providerEvidence }
   }
 
   /**
@@ -862,7 +895,8 @@ export class PayBoxCommerceExecutor implements CommerceExecutor {
     clientSubmissionKey: string,
     ref: PayBoxPreparedReference,
     envelope: PayBoxRequestEnvelope,
-    record: PayBoxRequestRecord
+    record: PayBoxRequestRecord,
+    providerEvidence: ProviderEvidenceSubmission
   ): Promise<ExecutionResult> {
     const payment = envelope.output?.value?.payment
     const resourceResponse = envelope.output?.value?.response
@@ -884,6 +918,7 @@ export class PayBoxCommerceExecutor implements CommerceExecutor {
         status: 'manual-recovery-required',
         reason: `PayBox gateway request ${ref.payboxRequestId} reported "success" but its payment/resource result failed validation (gateway=${payment?.gateway}, payment.status=${payment?.status}, payment.ok=${payment?.ok}, payment.network=${payment?.network}, payment.scheme=${payment?.scheme}, resource.status=${resourceResponse?.status}, resource.ok=${resourceResponse?.ok}) -- treating a malformed/inconsistent success as unpaid rather than guessing`,
         providerReference: `paybox:${ref.payboxRequestId}`,
+        providerEvidence,
       }
     }
 
@@ -895,7 +930,8 @@ export class PayBoxCommerceExecutor implements CommerceExecutor {
       resourceStatus: resourceResponse.status ?? null,
     })
 
-    return this.discoverTransaction(clientSubmissionKey, ref, { ...record, outputId: envelope.output_id ?? null, auditId: envelope.audit_id ?? null, resourceStatus: resourceResponse.status ?? null })
+    const outcome = await this.discoverTransaction(clientSubmissionKey, ref, { ...record, outputId: envelope.output_id ?? null, auditId: envelope.audit_id ?? null, resourceStatus: resourceResponse.status ?? null })
+    return { ...outcome, providerEvidence }
   }
 
   /**
