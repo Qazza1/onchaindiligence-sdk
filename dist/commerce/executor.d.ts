@@ -82,7 +82,7 @@ export type ExecutionOutcome = {
  * orchestration layer must never use it as a settlement observation.
  */
 export interface ProviderEvidenceSubmission {
-    provider: 'paybox';
+    provider: 'paybox' | 'cdp';
     providerVersion: string;
     payload: Record<string, unknown>;
 }
