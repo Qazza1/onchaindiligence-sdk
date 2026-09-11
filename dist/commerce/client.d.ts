@@ -193,9 +193,15 @@ export declare class CommerceOperation {
     /**
      * Provider evidence is an append-only, best-effort audit claim. It must not
      * change execution, finalization, or settlement behavior if OCD is
-     * temporarily unavailable. The C2 endpoint verifies the durable PayBox
-     * request binding before accepting it; retries of the same terminal
-     * provider snapshot are content-idempotent server-side.
+     * temporarily unavailable. The provider-evidence endpoint verifies the
+     * durable execution binding before accepting it; retries of the same
+     * terminal provider snapshot are content-idempotent server-side.
+     *
+     * The body key must match exactly what onchaindiligence-mcp's
+     * parseProviderEvidenceInput() dispatches on for each provider (D3.4C2's
+     * `paybox_response`, D3.4C5's `cdp_response`) -- Turnkey/Crossmint are
+     * webhook-driven and never reach this method (see their own executors'
+     * header notes on why they don't attach a ProviderEvidenceSubmission).
      */
     private recordProviderEvidenceBestEffort;
     /**

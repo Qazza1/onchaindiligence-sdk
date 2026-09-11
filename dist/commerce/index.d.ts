@@ -27,6 +27,7 @@ export * from './x402Executor.js';
 export * from './payboxExecutor.js';
 export * from './turnkeyExecutor.js';
 export * from './crossmintExecutor.js';
+export * from './cdpExecutor.js';
 export * from './client.js';
 export * from './policyTemplates.js';
 export * from './evidenceExport.js';
