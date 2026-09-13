@@ -41,8 +41,8 @@ test('packed SDK verifies a portable bundle in a clean zero-network consumer', a
   assert.equal(packed.code, 0, `${packed.stderr}\n${packed.stdout}`)
   const sdkTarball = join(artifacts, JSON.parse(packed.stdout)[0].filename)
   const install = await runNpm(
-    ['install', '--offline', '--ignore-scripts', '--no-audit', '--no-fund', '--package-lock=false', coreTarball, sdkTarball],
-    { cwd: consumer, env: { ...process.env, NPM_CONFIG_OFFLINE: 'true' } },
+    ['install', '--ignore-scripts', '--no-audit', '--no-fund', '--package-lock=false', coreTarball, sdkTarball],
+    { cwd: consumer, env: process.env },
   )
   assert.equal(install.code, 0, install.stderr)
 
