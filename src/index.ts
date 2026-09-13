@@ -36,6 +36,12 @@ import {
 } from './verification.js'
 
 export * from './verification.js'
+export {
+  verifyBundleOffline,
+  type OfflineBundleTrust,
+  type OfflineBundleVerificationOptions,
+  type OfflineBundleVerificationReport,
+} from './bundleVerification.js'
 
 export interface OnchainDiligenceOptions {
   /** A viem account used to sign/settle payments (e.g. privateKeyToAccount). */

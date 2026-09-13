@@ -24,6 +24,7 @@
 import { Mppx, tempo } from 'mppx/client';
 import { DEFAULT_ATTESTATION_ISSUER, verifyAttestationOffline, } from './verification.js';
 export * from './verification.js';
+export { verifyBundleOffline, } from './bundleVerification.js';
 export class OnchainDiligenceError extends Error {
     status;
     constructor(status, message) {

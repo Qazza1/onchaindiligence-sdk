@@ -1,6 +1,6 @@
 {
   "name": "@onchaindiligence/sdk",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "description": "TypeScript SDK for OnChainDiligence — policy preflight, recoverable agent payment lifecycles, independent settlement observation, and verifiable receipts.",
   "type": "module",
   "main": "./dist/index.js",
@@ -54,6 +54,7 @@
     "viem": "^2.56.0"
   },
   "dependencies": {
+    "@onchaindiligence/agent-evidence": "^0.3.0",
     "@x402/core": "^2.17.0",
     "@x402/evm": "^2.17.0",
     "@x402/fetch": "^2.17.0"

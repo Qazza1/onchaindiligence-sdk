@@ -197,6 +197,21 @@ the discovered registry as identity authority when the caller explicitly sets
 `od.verifyAttestation()` remains an online compatibility wrapper for existing
 clients; new security-sensitive code should use the standalone offline API.
 
+Portable Agent Evidence bundles use the same caller-supplied trust model and
+the canonical protocol verifier:
+
+```ts
+import { verifyBundleOffline } from '@onchaindiligence/sdk'
+
+const report = verifyBundleOffline(bundle, trustedKeys)
+// report.bundle_integrity, report.artifact_verifications,
+// report.reconciliation, report.limitations
+```
+
+`verifyBundleOffline()` performs no key discovery or network access. `VALID`
+means cryptographic integrity under the supplied trust policy; it does not
+establish authorization, safety, settlement, delivery, or truth.
+
 The signature authenticates the signer's `issued_at` assertion. It does not by
 itself prove objective time. A separately verified on-chain anchor can establish
 an external “existed no later than” bound; freshness, key validity, signature

@@ -24,6 +24,7 @@
 import type { Account } from 'viem';
 import { type AttestationKeyRecord, type AttestationVerificationResult, type Signed, type VerifyAttestationOptions } from './verification.js';
 export * from './verification.js';
+export { verifyBundleOffline, type OfflineBundleTrust, type OfflineBundleVerificationOptions, type OfflineBundleVerificationReport, } from './bundleVerification.js';
 export interface OnchainDiligenceOptions {
     /** A viem account used to sign/settle payments (e.g. privateKeyToAccount). */
     account: Account;
