@@ -48,23 +48,36 @@ test('packed SDK verifies a portable bundle in a clean zero-network consumer', a
 
   const corpus = join(root, 'node_modules', '@onchaindiligence', 'agent-evidence', 'conformance')
   const bundle = JSON.parse(readFileSync(join(corpus, 'bundle-with-artifacts.json'), 'utf8'))
+  const invalidReceiptBundle = JSON.parse(readFileSync(
+    join(corpus, 'bundle-invalid-embedded-receipt-no-external-proof.json'),
+    'utf8',
+  ))
   writeFileSync(join(consumer, 'bundle.json'), JSON.stringify(bundle))
+  writeFileSync(join(consumer, 'invalid-receipt-bundle.json'), JSON.stringify(invalidReceiptBundle))
   writeFileSync(join(consumer, 'keys.json'), JSON.stringify(bundle.verification_material.keys))
   writeFileSync(join(consumer, 'verify.mjs'), [
     "globalThis.fetch = () => { throw new Error('network access attempted') }",
     "import { readFileSync } from 'node:fs'",
     "import { verifyBundleOffline } from '@onchaindiligence/sdk'",
     "const bundle = JSON.parse(readFileSync('bundle.json', 'utf8'))",
+    "const invalidReceiptBundle = JSON.parse(readFileSync('invalid-receipt-bundle.json', 'utf8'))",
     "const keys = JSON.parse(readFileSync('keys.json', 'utf8'))",
-    "const report = verifyBundleOffline(bundle, keys, { now: new Date('2026-08-28T12:01:00.000Z') })",
-    'process.stdout.write(JSON.stringify(report))',
+    "const options = { now: new Date('2026-08-28T12:01:00.000Z') }",
+    'const report = verifyBundleOffline(bundle, keys, options)',
+    'const invalidReceiptReport = verifyBundleOffline(invalidReceiptBundle, keys, options)',
+    'process.stdout.write(JSON.stringify({ report, invalidReceiptReport }))',
   ].join('\n'))
 
   const verified = await run(process.execPath, [join(consumer, 'verify.mjs')], { cwd: consumer })
   assert.equal(verified.code, 0, verified.stderr)
-  const report = JSON.parse(verified.stdout)
+  const { report, invalidReceiptReport } = JSON.parse(verified.stdout)
   assert.equal(report.bundle_integrity.state, 'VALID')
   assert.ok(Array.isArray(report.artifact_verifications))
   assert.ok(report.reconciliation)
   assert.ok(Array.isArray(report.limitations))
+  assert.equal(invalidReceiptReport.bundle_integrity.state, 'VALID')
+  assert.equal(invalidReceiptReport.state, 'INVALID')
+  assert.ok(invalidReceiptReport.components.some(
+    (component) => component.component === 'receipt-proof' && component.state === 'INVALID',
+  ))
 })
