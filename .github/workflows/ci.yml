@@ -23,7 +23,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           repository: Qazza1/onchaindiligence
-          ref: b04a503a275abc865b424b83f5595e2c07591d1d
+          ref: 2e715a8c506ea45079d1b2fea76140706552cfc6
           path: .d42-core
           persist-credentials: false
       - run: npm ci --ignore-scripts --no-audit --no-fund
