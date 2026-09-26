@@ -32,3 +32,4 @@ export * from './circleExecutor.js';
 export * from './client.js';
 export * from './policyTemplates.js';
 export * from './evidenceExport.js';
+export * from './withOcd.js';
