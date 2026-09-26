@@ -136,7 +136,9 @@ export function withOcd(client, options) {
         flow.terminalEmitted = true;
         // Delivery is observational for the caller. It must not turn a settled
         // merchant request into a rejection because their callback failed.
-        Promise.resolve(options.onReceipt(result)).catch(() => { });
+        void Promise.resolve()
+            .then(() => options.onReceipt(result))
+            .catch(() => { });
     };
     const observeFallback = async (flow, context) => {
         const settlement = settlementTransaction(context);

@@ -121,6 +121,18 @@ for (const decision of ['BLOCK', 'REQUIRE_APPROVAL', 'UNKNOWN']) {
   })
 }
 
+test('withOcd: a synchronous callback throw cannot replace a BLOCK abort or begin payment', async () => {
+  const fake = installOcdFetch({ decision: 'BLOCK' })
+  try {
+    const client = new HookClient()
+    withOcd(client, { policy, onReceipt: () => { throw new Error('observer failed') } })
+    const blocked = await client.before[0](context(requirement('block-callback-throw')))
+    assert.equal(blocked.abort, true)
+    await flush()
+    assert.equal(fake.calls.some((x) => x.url.endsWith('/execution-bindings')), false)
+  } finally { fake.restore() }
+})
+
 test('withOcd: a missing PAYMENT-RESPONSE produces no-receipt and no finalization', async () => {
   const fake = installOcdFetch()
   try {
@@ -133,6 +145,32 @@ test('withOcd: a missing PAYMENT-RESPONSE produces no-receipt and no finalizatio
     assert.deepEqual(received.map((x) => x.kind), ['no-receipt'])
     assert.equal(received[0].reason, 'settlement-response-missing')
     assert.equal(fake.calls.some((x) => x.url.endsWith('/finalize')), false)
+  } finally { fake.restore() }
+})
+
+test('withOcd: a synchronous callback throw cannot reject a missing PAYMENT-RESPONSE hook', async () => {
+  const fake = installOcdFetch()
+  try {
+    const client = new HookClient()
+    withOcd(client, { policy, onReceipt: () => { throw new Error('observer failed') } })
+    const selected = requirement('missing-callback-throw')
+    await client.before[0](context(selected))
+    await assert.doesNotReject(client.responses[0](response(selected, undefined)))
+    await flush()
+    assert.equal(fake.calls.some((x) => x.url.endsWith('/finalize')), false)
+  } finally { fake.restore() }
+})
+
+test('withOcd: a rejected async callback cannot alter full-lifecycle finalization', async () => {
+  const fake = installOcdFetch()
+  try {
+    const client = new HookClient()
+    withOcd(client, { policy, onReceipt: () => Promise.reject(new Error('observer failed')) })
+    const selected = requirement('full-callback-reject')
+    await client.before[0](context(selected))
+    await assert.doesNotReject(client.responses[0](response(selected, { success: true, transaction: TX, network: 'eip155:8453' })))
+    await flush()
+    assert.equal(fake.finalizeCalls, 1)
   } finally { fake.restore() }
 })
 
@@ -322,17 +360,17 @@ test('withOcd: a pending finalization preserves the supplied recovery record bef
   } finally { fake.restore() }
 })
 
-test('withOcd: receipt delivery fires once for repeated response-hook delivery', async () => {
+test('withOcd: a terminal callback is attempted once for repeated response-hook delivery, even when it throws', async () => {
   const fake = installOcdFetch()
   try {
-    const client = new HookClient(); const received = []
-    withOcd(client, { policy, onReceipt: (result) => received.push(result) })
+    const client = new HookClient(); let attempts = 0
+    withOcd(client, { policy, onReceipt: () => { attempts += 1; throw new Error('observer failed') } })
     const selected = requirement('once')
     await client.before[0](context(selected))
     const settled = response(selected, { success: true, transaction: TX, network: 'eip155:8453' })
     await client.responses[0](settled)
     await client.responses[0](settled)
     await flush()
-    assert.equal(received.filter((x) => x.kind === 'full-lifecycle').length, 1)
+    assert.equal(attempts, 1)
   } finally { fake.restore() }
 })
