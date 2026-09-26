@@ -57,6 +57,55 @@ See **[examples/quickstart.ts](examples/quickstart.ts)** for the complete,
 runnable, ~20-line integration (uses a mocked executor and an in-process demo
 server — `npx tsx examples/quickstart.ts` costs nothing and needs no wallet).
 
+### Existing x402 client: thin OCD wrapper
+
+If you already use an `@x402/core` v2 client and
+`wrapFetchWithPayment`, `withOcd` adds the existing OCD preflight,
+binding, observation, and signed-receipt lifecycle around that client. It is
+a minimal integration, not a claim that a payment integration is literally one
+physical line of code.
+
+```ts
+import { withOcd } from '@onchaindiligence/sdk/commerce'
+import { wrapFetchWithPayment } from '@x402/fetch'
+
+const client = withOcd(existingClient, {
+  policy,
+  onReceipt: (result) => {
+    // Save or inspect a full-lifecycle, post-payment-evidence, blocked, or no-receipt result.
+  },
+})
+
+const fetchWithPay = wrapFetchWithPayment(fetch, client)
+await fetchWithPay('https://merchant.example/paid')
+```
+
+The existing wallet/signer stays entirely under the integrator's control;
+its private key is never sent to OCD. Before the x402 client creates a
+payment payload, the wrapper submits the exact selected x402 requirement to
+OCD's policy preflight. `BLOCK`, `REQUIRE_APPROVAL`, and `UNKNOWN` abort
+payment creation. An OCD `ALLOW` remains a policy result, not wallet
+authorization.
+
+The wrapper supports **x402 v2 `exact`** requirements only. It is Node-first;
+browser use is not supported in v1. It uses `InMemoryRecoveryStore` by default
+for a normal process lifetime. For serverless or crash/restart recovery, pass a
+durable `CommerceRecoveryStore` and resume the saved operation with the
+commerce client; never store recovery credentials in browser storage. Receipt
+finalization may complete after the merchant HTTP response, so save the
+asynchronous `onReceipt` result. While the process remains alive, the wrapper
+retries observation-pending finalization for the same operation; a crash or
+serverless restart still requires a durable store and caller-owned recovery.
+Each successful full lifecycle still incurs OCD's existing preflight fee.
+
+If OCD cannot be reached before an operation is opened, the default is to
+abort. `onOcdUnavailable: 'proceed'` is a deliberately narrow exception: once
+the external payment succeeds with a transaction hash, OCD calls its existing
+free `/observe-payment` endpoint and returns a signed
+`post-payment-evidence` receipt asynchronously. That receipt has decision
+`UNKNOWN`, no preflight link, and no authorization claim. It is never used
+after any preflight attempt or finalization failure.
+
 Key pieces:
 
 | Export | What it is |
@@ -70,7 +119,7 @@ Key pieces:
 | `CdpCommerceExecutor` | Production executor for Coinbase Developer Platform (CDP) Server Wallet v2 EOA accounts: Base mainnet, USDC, `sendEvmTransaction`. Unlike the other three, CDP's send call is synchronous and returns the transaction hash directly — there's no separate provider request id, and Smart Account/user-operation execution is out of scope (a Smart Account send would return a distinct `userOpHash`, which this executor never touches). `recoveryMode` is `'stable-payment-identity'`; CDP documents its `X-Idempotency-Key` more strongly than the others ("duplicate requests with the same key return identical responses"), which this executor's ambiguous-retry error message says plainly. CDP has no wallet webhook, so — like PayBox — this executor itself submits the caller-reported provider claim. Needs its own `CdpRequestStore` (`InMemoryCdpRequestStore` is test-only). |
 | `CircleCommerceExecutor` | Production executor for [Circle](https://circle.com) Developer-Controlled Wallets: Base mainnet, USDC, `POST /v1/w3s/developer/transactions/transfer`. Circle's own `id` (durable transaction identity) and eventual `txHash` are two distinct, separately-documented fields, never conflated. `recoveryMode` is `'stable-payment-identity'`: Circle's `idempotencyKey` must be a UUID v4, so this executor deterministically derives one from `clientSubmissionKey` rather than requiring the caller to supply one. As with Turnkey/Crossmint, Circle's own signed `transactions.outbound` webhook (verified server-side by OCD) is the primary evidence path, not a caller-reported claim. |
 | `MockCommerceExecutor` | Deterministic, no-network executor for tests/docs. |
-| `CommerceRecoveryStore` | Durable identity storage — required, no safe default. `NodeFileRecoveryStore` (`@onchaindiligence/sdk/commerce/node` — Node-only, wraps `node:fs`) survives a restart; implement the interface against your own database for a multi-instance deployment, or proxy it through your own local server for a browser UI (never store the secret fields in browser storage). `InMemoryRecoveryStore` is test-only. |
+| `CommerceRecoveryStore` | Durable identity storage for restart recovery. `NodeFileRecoveryStore` (`@onchaindiligence/sdk/commerce/node` — Node-only, wraps `node:fs`) survives a restart; implement the interface against your own database for a multi-instance deployment. `withOcd` defaults to `InMemoryRecoveryStore` for one normal Node process lifetime only; serverless/crash recovery requires a supplied durable store. Never store recovery credentials in browser storage. |
 | `apiPurchasePolicy` / `approvalAboveThresholdPolicy` / `fixedRecipientPolicy` | Three starter policy templates — ordinary strict policy objects, no new semantics. |
 | `buildEvidenceExport` | A minimal, deterministic, secret-free evidence manifest. |
 | `client.getReceipt()` / `client.verifyReceipt()` | Free, structured, reuse OCD's converged verification contract — a convenience, not a stronger trust model than verifying offline yourself. |
