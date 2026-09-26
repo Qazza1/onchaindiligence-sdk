@@ -12,6 +12,7 @@ import { InMemoryRecoveryStore, type CommerceRecoveryStore } from './recoverySto
 import type { CommercePolicy, ReceiptDecision, ReceiptEnvelope } from './types.js'
 
 const DEFAULT_BASE_URL = 'https://mcp.onchaindiligence.com'
+const DEFAULT_FINALIZATION_RETRY_SECONDS = 5
 
 /** Alias kept intentionally small: the wrapper accepts the existing commerce policy wire contract. */
 export type Policy = CommercePolicy
@@ -128,12 +129,17 @@ const CANONICAL_ASSETS: Record<string, string> = {
   'eip155:8453': '0x833589fcd6edb6e08f4c7c32d4f71b54bda02913',
   'eip155:1': '0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48',
   'eip155:4217': '0x20c0000000000000000000000000000000000000',
-  'solana:mainnet': 'epjfwdd5aufqssqem2qn1xzybapc8g4weggkzwyt1vt',
+  'solana:mainnet': 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v',
 }
 
 function isCanonicalRequirement(requirements: PaymentRequirements): boolean {
   const expected = CANONICAL_ASSETS[requirements.network]
-  return expected !== undefined && requirements.asset.toLowerCase() === expected
+  if (expected === undefined) return false
+  // EVM addresses are case-insensitive. Solana base58 mint identifiers are
+  // not: lowercasing one can silently identify a different asset.
+  return requirements.network.startsWith('eip155:')
+    ? requirements.asset.toLowerCase() === expected
+    : requirements.asset === expected
 }
 
 function decimalAmount(atomic: string): string {
@@ -159,6 +165,10 @@ function settlementTransaction(context: PaymentResponseContext): DeferredSettlem
   if (!context.settleResponse.success) return { kind: 'no-receipt', reason: 'payment-failed' }
   if (!context.settleResponse.transaction) return { kind: 'no-receipt', reason: 'settlement-response-missing' }
   return { kind: 'transaction-known', transactionHash: context.settleResponse.transaction }
+}
+
+function wait(milliseconds: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds))
 }
 
 /**
@@ -207,6 +217,47 @@ export function withOcd(client: x402Client, options: WithOcdOptions): x402Client
       emit(flow, { kind: 'post-payment-evidence', receipt: (await res.json()) as ReceiptEnvelope })
     } catch {
       emit(flow, { kind: 'no-receipt', reason: 'observation-only-failed' })
+    }
+  }
+
+  const finalizationCapabilityExpired = async (operationId: string): Promise<boolean> => {
+    const record = await store.load(operationId).catch(() => null)
+    if (!record?.finalizationCapabilityExpiresAt) return false
+    const expiry = Date.parse(record.finalizationCapabilityExpiresAt)
+    return Number.isFinite(expiry) && expiry <= Date.now()
+  }
+
+  const finalizeInBackground = async (flow: LifecycleFlow): Promise<void> => {
+    while (true) {
+      if (await finalizationCapabilityExpired(flow.operation.operationId)) {
+        emit(flow, { kind: 'no-receipt', reason: 'finalization-capability-expired', operationId: flow.operation.operationId })
+        return
+      }
+
+      try {
+        const finalized = await flow.operation.observeAndFinalize()
+        if (finalized.kind === 'receipt-produced') {
+          emit(flow, { kind: 'full-lifecycle', receipt: finalized.receipt, operationId: flow.operation.operationId })
+          return
+        }
+        if (finalized.kind === 'terminal-error') {
+          emit(flow, { kind: 'no-receipt', reason: 'finalization-terminal-error', operationId: flow.operation.operationId })
+          return
+        }
+
+        // `pending` is an observation delay, not a reason to create another
+        // operation or submit a second payment. Retry this exact operation
+        // while this process remains alive; a crash is recovered by the
+        // caller's durable CommerceRecoveryStore.
+        if (await finalizationCapabilityExpired(flow.operation.operationId)) {
+          emit(flow, { kind: 'no-receipt', reason: 'finalization-capability-expired', operationId: flow.operation.operationId })
+          return
+        }
+        await wait((finalized.retryAfterSeconds ?? DEFAULT_FINALIZATION_RETRY_SECONDS) * 1000)
+      } catch {
+        emit(flow, { kind: 'no-receipt', reason: 'finalization-terminal-error', operationId: flow.operation.operationId })
+        return
+      }
     }
   }
 
@@ -291,10 +342,9 @@ export function withOcd(client: x402Client, options: WithOcdOptions): x402Client
     const flow = flows.get(context.requirements)
     if (!flow) return
     if (flow.kind === 'fallback') {
-      // This is deliberately awaited only for the fallback: there is no
-      // existing lifecycle operation to advance and no merchant Response is
-      // mutated. The regular finalization branch below stays detached.
-      await observeFallback(flow, context)
+      // Receipt delivery is never on the merchant response path, including
+      // the narrow observation-only fallback.
+      void observeFallback(flow, context).catch(() => {})
       return
     }
 
@@ -315,8 +365,7 @@ export function withOcd(client: x402Client, options: WithOcdOptions): x402Client
     void flow.execution
       .then(async (execution) => {
         if (!execution || typeof execution !== 'object' || (execution as { kind?: string }).kind !== 'execution-recorded') return
-        const finalized = await flow.operation.observeAndFinalize()
-        if (finalized.kind === 'receipt-produced') emit(flow, { kind: 'full-lifecycle', receipt: finalized.receipt, operationId: flow.operation.operationId })
+        await finalizeInBackground(flow)
       })
       .catch(() => {
         // The durable operation remains in the supplied recovery store. Do

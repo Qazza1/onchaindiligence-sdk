@@ -93,16 +93,18 @@ for a normal process lifetime. For serverless or crash/restart recovery, pass a
 durable `CommerceRecoveryStore` and resume the saved operation with the
 commerce client; never store recovery credentials in browser storage. Receipt
 finalization may complete after the merchant HTTP response, so save the
-asynchronous `onReceipt` result. Each successful full lifecycle still incurs
-OCD's existing preflight fee.
+asynchronous `onReceipt` result. While the process remains alive, the wrapper
+retries observation-pending finalization for the same operation; a crash or
+serverless restart still requires a durable store and caller-owned recovery.
+Each successful full lifecycle still incurs OCD's existing preflight fee.
 
 If OCD cannot be reached before an operation is opened, the default is to
 abort. `onOcdUnavailable: 'proceed'` is a deliberately narrow exception: once
 the external payment succeeds with a transaction hash, OCD calls its existing
 free `/observe-payment` endpoint and returns a signed
-`post-payment-evidence` receipt. That receipt has decision `UNKNOWN`, no
-preflight link, and no authorization claim. It is never used after any
-preflight attempt or finalization failure.
+`post-payment-evidence` receipt asynchronously. That receipt has decision
+`UNKNOWN`, no preflight link, and no authorization claim. It is never used
+after any preflight attempt or finalization failure.
 
 Key pieces:
 

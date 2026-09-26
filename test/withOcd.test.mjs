@@ -44,12 +44,15 @@ function response(requirements, settleResponse) {
   return { paymentPayload: { x402Version: 2, accepted: requirements, payload: {} }, requirements, settleResponse }
 }
 
-function json(value, status = 200) { return new Response(JSON.stringify(value), { status, headers: { 'content-type': 'application/json' } }) }
+function json(value, status = 200, headers = {}) {
+  return new Response(JSON.stringify(value), { status, headers: { 'content-type': 'application/json', ...headers } })
+}
 
-function installOcdFetch({ decision = 'ALLOW', openFails = false, preflightFails = false, finalize = 'receipt' } = {}) {
+function installOcdFetch({ decision = 'ALLOW', openFails = false, preflightFails = false, finalize = 'receipt', observeDelayMs = 0 } = {}) {
   const original = globalThis.fetch
   const calls = []
   let operations = 0
+  let finalizeCalls = 0
   globalThis.fetch = async (input, init = {}) => {
     const url = String(input)
     calls.push({ url, method: init.method ?? 'GET', body: init.body })
@@ -64,16 +67,23 @@ function installOcdFetch({ decision = 'ALLOW', openFails = false, preflightFails
     }
     if (url.includes('/execution-bindings') && init.method === 'POST') return json({ execution_request_id: `binding-${operations}` })
     if (url.endsWith('/finalize')) {
-      if (finalize === 'pending') return json({ error: 'not final' }, 425)
+      finalizeCalls += 1
+      if (finalize === 'pending' || (finalize === 'pending-once' && finalizeCalls === 1) || (finalize === 'pending-twice' && finalizeCalls <= 2) || (finalize === 'pending-then-terminal' && finalizeCalls === 1)) {
+        return json({ error: 'not final' }, 425, { 'retry-after': '0.001' })
+      }
+      if (finalize === 'terminal' || finalize === 'pending-then-terminal') return json({ error: 'cannot finalize' }, 409)
       return json({ ...envelope('ALLOW', `commerce-${operations}`), ocd_lifecycle_evidence: null })
     }
-    if (url.endsWith('/observe-payment')) return json(envelope('UNKNOWN', 'observation-only'))
+    if (url.endsWith('/observe-payment')) {
+      if (observeDelayMs) await new Promise((resolve) => setTimeout(resolve, observeDelayMs))
+      return json(envelope('UNKNOWN', 'observation-only'))
+    }
     throw new Error(`unexpected fetch ${url}`)
   }
-  return { calls, restore: () => { globalThis.fetch = original } }
+  return { calls, get finalizeCalls() { return finalizeCalls }, restore: () => { globalThis.fetch = original } }
 }
 
-async function flush() { await new Promise((resolve) => setTimeout(resolve, 15)) }
+async function flush(delay = 15) { await new Promise((resolve) => setTimeout(resolve, delay)) }
 
 const policy = { acknowledge_unconstrained: true }
 
@@ -90,6 +100,8 @@ test('withOcd: allowed x402 v2 exact payment reaches a full lifecycle receipt wi
     await flush()
     assert.deepEqual(received.map((x) => x.kind), ['full-lifecycle'])
     assert.equal(received[0].operationId, 'op-1')
+    const finalize = fake.calls.find((x) => x.url.endsWith('/finalize'))
+    assert.equal(JSON.parse(finalize.body).execution_provider, 'x402')
   } finally { fake.restore() }
 })
 
@@ -186,16 +198,85 @@ test('withOcd: open failure aborts by default', async () => {
   } finally { fake.restore() }
 })
 
-test('withOcd: open failure plus proceed creates only existing observation-only evidence after a settled tx', async () => {
-  const fake = installOcdFetch({ openFails: true })
+test('withOcd: open failure plus proceed creates only existing observation-only evidence after a settled tx without delaying the payment hook', async () => {
+  const fake = installOcdFetch({ openFails: true, observeDelayMs: 30 })
   try {
     const client = new HookClient(); const received = []
     withOcd(client, { policy, onOcdUnavailable: 'proceed', onReceipt: (result) => received.push(result) })
     const selected = requirement('fallback')
     assert.equal(await client.before[0](context(selected)), undefined)
     await client.responses[0](response(selected, { success: true, transaction: TX, network: 'eip155:8453' }))
+    assert.deepEqual(received, [], 'the payment response hook must not wait for /observe-payment')
+    await flush(50)
     assert.deepEqual(received.map((x) => x.kind), ['post-payment-evidence'])
     assert.equal(fake.calls.filter((x) => x.url.endsWith('/observe-payment')).length, 1)
+  } finally { fake.restore() }
+})
+
+test('withOcd: retries one pending finalization on the same operation and emits one full-lifecycle receipt', async () => {
+  const fake = installOcdFetch({ finalize: 'pending-once' })
+  try {
+    const client = new HookClient(); const received = []
+    withOcd(client, { policy, onReceipt: (result) => received.push(result) })
+    const selected = requirement('finalize-pending-once')
+    await client.before[0](context(selected))
+    await client.responses[0](response(selected, { success: true, transaction: TX, network: 'eip155:8453' }))
+    await flush(40)
+    assert.deepEqual(received.map((x) => x.kind), ['full-lifecycle'])
+    assert.equal(fake.finalizeCalls, 2)
+    assert.equal(fake.calls.filter((x) => x.url.endsWith('/execution-bindings')).length, 1)
+    assert.equal(fake.calls.filter((x) => x.url.endsWith('/operations')).length, 1)
+  } finally { fake.restore() }
+})
+
+test('withOcd: repeated pending finalization retries do not create another payment or binding', async () => {
+  const fake = installOcdFetch({ finalize: 'pending-twice' })
+  try {
+    const client = new HookClient(); const received = []
+    withOcd(client, { policy, onReceipt: (result) => received.push(result) })
+    const selected = requirement('finalize-pending-twice')
+    await client.before[0](context(selected))
+    await client.responses[0](response(selected, { success: true, transaction: TX, network: 'eip155:8453' }))
+    await flush(50)
+    assert.deepEqual(received.map((x) => x.kind), ['full-lifecycle'])
+    assert.equal(fake.finalizeCalls, 3)
+    assert.equal(fake.calls.filter((x) => x.url.endsWith('/execution-bindings')).length, 1)
+    assert.equal(fake.calls.filter((x) => x.url.endsWith('/operations')).length, 1)
+  } finally { fake.restore() }
+})
+
+test('withOcd: a terminal finalization error emits no-receipt with its operation id', async () => {
+  const fake = installOcdFetch({ finalize: 'terminal' })
+  try {
+    const client = new HookClient(); const received = []
+    withOcd(client, { policy, onReceipt: (result) => received.push(result) })
+    const selected = requirement('finalize-terminal')
+    await client.before[0](context(selected))
+    await client.responses[0](response(selected, { success: true, transaction: TX, network: 'eip155:8453' }))
+    await flush()
+    assert.deepEqual(received, [{ kind: 'no-receipt', reason: 'finalization-terminal-error', operationId: 'op-1' }])
+  } finally { fake.restore() }
+})
+
+test('withOcd: Solana canonical USDC comparison is exact and case-sensitive', async () => {
+  const fake = installOcdFetch()
+  try {
+    const client = new HookClient(); const received = []
+    withOcd(client, { policy, onReceipt: (result) => received.push(result) })
+    const canonical = requirement('solana-canonical', {
+      network: 'solana:mainnet',
+      asset: 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v',
+    })
+    assert.equal(await client.before[0](context(canonical)), undefined)
+    await client.responses[0](response(canonical, { success: false, transaction: '', network: 'solana:mainnet' }))
+    const mutated = requirement('solana-mutated', {
+      network: 'solana:mainnet',
+      asset: 'epjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v',
+    })
+    const blocked = await client.before[0](context(mutated))
+    assert.equal(blocked.abort, true)
+    await flush()
+    assert.ok(received.some((result) => result.kind === 'no-receipt' && result.reason === 'unsupported-canonical-asset'))
   } finally { fake.restore() }
 })
 
@@ -226,16 +307,16 @@ test('withOcd: payment failure never creates a receipt', async () => {
   } finally { fake.restore() }
 })
 
-test('withOcd: finalization pending preserves the supplied recovery record and does not fake a receipt', async () => {
-  const fake = installOcdFetch({ finalize: 'pending' })
+test('withOcd: a pending finalization preserves the supplied recovery record before a later terminal result', async () => {
+  const fake = installOcdFetch({ finalize: 'pending-then-terminal' })
   try {
     const store = new InMemoryRecoveryStore(); const client = new HookClient(); const received = []
     withOcd(client, { policy, store, onReceipt: (result) => received.push(result) })
     const selected = requirement('pending')
     await client.before[0](context(selected))
     await client.responses[0](response(selected, { success: true, transaction: TX, network: 'eip155:8453' }))
-    await flush()
-    assert.deepEqual(received, [])
+    await flush(40)
+    assert.deepEqual(received, [{ kind: 'no-receipt', reason: 'finalization-terminal-error', operationId: 'op-1' }])
     const record = await store.load('op-1')
     assert.equal(record.transactionHash, TX)
   } finally { fake.restore() }

@@ -100,7 +100,7 @@ export interface OpenParams {
 }
 
 function mapExecutorIdToProvider(executorId: string | null): 'x402' | 'paybox' | 'wallet' | 'other' {
-  if (executorId === 'x402-base-usdc-exact') return 'x402'
+  if (executorId === 'x402-base-usdc-exact' || executorId === 'x402-v2-deferred-client') return 'x402'
   if (executorId === 'paybox-x402-base-usdc') return 'paybox'
   return 'other'
 }

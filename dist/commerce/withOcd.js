@@ -1,6 +1,7 @@
 import { createCommerceClient } from './client.js';
 import { InMemoryRecoveryStore } from './recoveryStore.js';
 const DEFAULT_BASE_URL = 'https://mcp.onchaindiligence.com';
+const DEFAULT_FINALIZATION_RETRY_SECONDS = 5;
 export class OcdPaymentPolicyError extends Error {
     constructor(message) {
         super(message);
@@ -70,11 +71,17 @@ const CANONICAL_ASSETS = {
     'eip155:8453': '0x833589fcd6edb6e08f4c7c32d4f71b54bda02913',
     'eip155:1': '0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48',
     'eip155:4217': '0x20c0000000000000000000000000000000000000',
-    'solana:mainnet': 'epjfwdd5aufqssqem2qn1xzybapc8g4weggkzwyt1vt',
+    'solana:mainnet': 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v',
 };
 function isCanonicalRequirement(requirements) {
     const expected = CANONICAL_ASSETS[requirements.network];
-    return expected !== undefined && requirements.asset.toLowerCase() === expected;
+    if (expected === undefined)
+        return false;
+    // EVM addresses are case-insensitive. Solana base58 mint identifiers are
+    // not: lowercasing one can silently identify a different asset.
+    return requirements.network.startsWith('eip155:')
+        ? requirements.asset.toLowerCase() === expected
+        : requirements.asset === expected;
 }
 function decimalAmount(atomic) {
     if (!/^\d+$/.test(atomic))
@@ -103,6 +110,9 @@ function settlementTransaction(context) {
     if (!context.settleResponse.transaction)
         return { kind: 'no-receipt', reason: 'settlement-response-missing' };
     return { kind: 'transaction-known', transactionHash: context.settleResponse.transaction };
+}
+function wait(milliseconds) {
+    return new Promise((resolve) => setTimeout(resolve, milliseconds));
 }
 /**
  * Registers OCD lifecycle hooks on an existing x402 v2 client and returns the
@@ -150,6 +160,45 @@ export function withOcd(client, options) {
         }
         catch {
             emit(flow, { kind: 'no-receipt', reason: 'observation-only-failed' });
+        }
+    };
+    const finalizationCapabilityExpired = async (operationId) => {
+        const record = await store.load(operationId).catch(() => null);
+        if (!record?.finalizationCapabilityExpiresAt)
+            return false;
+        const expiry = Date.parse(record.finalizationCapabilityExpiresAt);
+        return Number.isFinite(expiry) && expiry <= Date.now();
+    };
+    const finalizeInBackground = async (flow) => {
+        while (true) {
+            if (await finalizationCapabilityExpired(flow.operation.operationId)) {
+                emit(flow, { kind: 'no-receipt', reason: 'finalization-capability-expired', operationId: flow.operation.operationId });
+                return;
+            }
+            try {
+                const finalized = await flow.operation.observeAndFinalize();
+                if (finalized.kind === 'receipt-produced') {
+                    emit(flow, { kind: 'full-lifecycle', receipt: finalized.receipt, operationId: flow.operation.operationId });
+                    return;
+                }
+                if (finalized.kind === 'terminal-error') {
+                    emit(flow, { kind: 'no-receipt', reason: 'finalization-terminal-error', operationId: flow.operation.operationId });
+                    return;
+                }
+                // `pending` is an observation delay, not a reason to create another
+                // operation or submit a second payment. Retry this exact operation
+                // while this process remains alive; a crash is recovered by the
+                // caller's durable CommerceRecoveryStore.
+                if (await finalizationCapabilityExpired(flow.operation.operationId)) {
+                    emit(flow, { kind: 'no-receipt', reason: 'finalization-capability-expired', operationId: flow.operation.operationId });
+                    return;
+                }
+                await wait((finalized.retryAfterSeconds ?? DEFAULT_FINALIZATION_RETRY_SECONDS) * 1000);
+            }
+            catch {
+                emit(flow, { kind: 'no-receipt', reason: 'finalization-terminal-error', operationId: flow.operation.operationId });
+                return;
+            }
         }
     };
     client.onBeforePaymentCreation(async (context) => {
@@ -234,10 +283,9 @@ export function withOcd(client, options) {
         if (!flow)
             return;
         if (flow.kind === 'fallback') {
-            // This is deliberately awaited only for the fallback: there is no
-            // existing lifecycle operation to advance and no merchant Response is
-            // mutated. The regular finalization branch below stays detached.
-            await observeFallback(flow, context);
+            // Receipt delivery is never on the merchant response path, including
+            // the narrow observation-only fallback.
+            void observeFallback(flow, context).catch(() => { });
             return;
         }
         // A transport/adapter may defensively surface the same result twice. It
@@ -257,9 +305,7 @@ export function withOcd(client, options) {
             .then(async (execution) => {
             if (!execution || typeof execution !== 'object' || execution.kind !== 'execution-recorded')
                 return;
-            const finalized = await flow.operation.observeAndFinalize();
-            if (finalized.kind === 'receipt-produced')
-                emit(flow, { kind: 'full-lifecycle', receipt: finalized.receipt, operationId: flow.operation.operationId });
+            await finalizeInBackground(flow);
         })
             .catch(() => {
             // The durable operation remains in the supplied recovery store. Do
