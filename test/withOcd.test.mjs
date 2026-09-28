@@ -388,17 +388,23 @@ const preflightAction = (fake) => JSON.parse(fake.calls.find((x) => x.url.endsWi
 test('withOcd: settlement_pending with a broadcast transaction is not payment-failed and finalizes the same operation once observed', async () => {
   const fake = installOcdFetch({ finalize: 'pending-once' })
   try {
-    const client = new HookClient(); const received = []
-    withOcd(client, { policy, onReceipt: (result) => received.push(result) })
+    // Distinctive broadcast reference: any substitution (e.g. the shared TX fixture) is obvious.
+    const BROADCAST_TX = '0x5e771e3e17d1e6d1ab0ad0ca57c0ffee' + '0123456789abcdef'.repeat(2)
+    const store = new InMemoryRecoveryStore(); const client = new HookClient(); const received = []
+    withOcd(client, { policy, store, onReceipt: (result) => received.push(result) })
     const selected = requirement('settle-pending-tx')
     await client.before[0](context(selected))
-    const hookResult = await client.responses[0](response(selected, { success: false, errorReason: 'settlement_pending', transaction: TX, network: 'eip155:8453' }))
+    const hookResult = await client.responses[0](response(selected, { success: false, errorReason: 'settlement_pending', transaction: BROADCAST_TX, network: 'eip155:8453' }))
     assert.equal(hookResult, undefined, 'the response hook must never ask x402 to recover/retry the payment')
     await flush(40)
     assert.equal(received.some((x) => x.reason === 'payment-failed'), false)
     assert.deepEqual(received.map((x) => x.kind), ['full-lifecycle'])
     assert.equal(received[0].operationId, 'op-1')
     assert.equal(fake.finalizeCalls, 2, 'finalization waits (pending) until OCD independently observes the transaction')
+    assert.equal((await store.load('op-1')).transactionHash, BROADCAST_TX, 'the recovery/execution record keeps the exact x402 broadcast reference')
+    const finalizeBodies = fake.calls.filter((x) => x.url.endsWith('/operations/op-1/finalize')).map((x) => JSON.parse(x.body))
+    assert.equal(finalizeBodies.length, 2)
+    assert.ok(finalizeBodies.every((body) => body.transaction_hash === BROADCAST_TX), 'every finalization of the same operation sends that exact reference')
     assert.equal(fake.calls.filter((x) => x.url.endsWith('/operations')).length, 1)
     assert.equal(fake.calls.filter((x) => x.url.endsWith('/execution-bindings')).length, 1)
   } finally { fake.restore() }
