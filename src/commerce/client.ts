@@ -269,9 +269,10 @@ export class OnchainDiligenceCommerceClient {
    */
   async observePayment(params: ObservePaymentParams): Promise<ObservePaymentResult> {
     const body: Record<string, string> = { network: params.network, transaction_hash: params.transactionReference }
-    if (params.expected?.recipient) body.expected_recipient = params.expected.recipient
-    if (params.expected?.asset) body.expected_asset = params.expected.asset
-    if (params.expected?.amount) body.expected_amount = params.expected.amount
+    // A supplied assertion is forwarded exactly (even ""), so the backend validates it rather than it vanishing.
+    if (params.expected?.recipient !== undefined) body.expected_recipient = params.expected.recipient
+    if (params.expected?.asset !== undefined) body.expected_asset = params.expected.asset
+    if (params.expected?.amount !== undefined) body.expected_amount = params.expected.amount
     const res = await this.apiFetch('/observe-payment', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) })
     const retryAfter = Number(res.headers.get('retry-after'))
     const retryAfterSeconds = Number.isFinite(retryAfter) && retryAfter > 0 ? retryAfter : null

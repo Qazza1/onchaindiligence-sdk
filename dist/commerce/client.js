@@ -213,11 +213,12 @@ export class OnchainDiligenceCommerceClient {
      */
     async observePayment(params) {
         const body = { network: params.network, transaction_hash: params.transactionReference };
-        if (params.expected?.recipient)
+        // A supplied assertion is forwarded exactly (even ""), so the backend validates it rather than it vanishing.
+        if (params.expected?.recipient !== undefined)
             body.expected_recipient = params.expected.recipient;
-        if (params.expected?.asset)
+        if (params.expected?.asset !== undefined)
             body.expected_asset = params.expected.asset;
-        if (params.expected?.amount)
+        if (params.expected?.amount !== undefined)
             body.expected_amount = params.expected.amount;
         const res = await this.apiFetch('/observe-payment', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) });
         const retryAfter = Number(res.headers.get('retry-after'));

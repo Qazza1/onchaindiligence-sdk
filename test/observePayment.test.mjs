@@ -72,3 +72,20 @@ test('a receipt for a different transaction or network is never returned as the 
   const solana = receipt({ action: { ...receipt().receipt.action, network: 'solana:mainnet' }, execution: { ...receipt().receipt.execution, transaction_hash: 'SigCase' } })
   await assert.rejects(client(200, solana).ocd.observePayment({ network: 'solana:mainnet', transactionReference: 'sigcase' }), /does not match/, 'Solana signatures compare case-sensitively')
 })
+
+test('supplied expectations are forwarded exactly, including empty strings; omitted ones stay omitted', async () => {
+  for (const field of ['recipient', 'asset', 'amount']) {
+    const { calls, ocd } = client(400, { error: `expected_${field} must be a non-empty string, or null` })
+    const result = await ocd.observePayment({ network: 'eip155:8453', transactionReference: TX, expected: { [field]: '' } })
+    assert.deepEqual(JSON.parse(calls[0].init.body), { network: 'eip155:8453', transaction_hash: TX, [`expected_${field}`]: '' }, `${field}: "" is not silently omitted`)
+    assert.equal(result.kind, 'rejected')
+  }
+  const omitted = client(200, receipt())
+  await omitted.ocd.observePayment({ network: 'eip155:8453', transactionReference: TX, expected: {} })
+  assert.deepEqual(JSON.parse(omitted.calls[0].init.body), { network: 'eip155:8453', transaction_hash: TX })
+  const exact = client(200, receipt())
+  const values = { recipient: ' 0xAbC0000000000000000000000000000000000001', asset: '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913', amount: '1.500' }
+  await exact.ocd.observePayment({ network: 'eip155:8453', transactionReference: TX, expected: values })
+  const sent = JSON.parse(exact.calls[0].init.body)
+  assert.equal(sent.expected_recipient, values.recipient); assert.equal(sent.expected_asset, values.asset); assert.equal(sent.expected_amount, values.amount)
+})
