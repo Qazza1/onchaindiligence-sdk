@@ -205,6 +205,51 @@ export class OnchainDiligenceCommerceClient {
             throw new Error(`get-receipt failed: ${await this.readError(res)}`);
         return (await res.json());
     }
+    /**
+     * Free observation-only receipt for a payment that already happened, via
+     * the existing POST /observe-payment. Needs no operation, recovery store
+     * entry or payment. OCD independently observes the chain; a transaction
+     * that already has a receipt returns that receipt (`existing: true`).
+     */
+    async observePayment(params) {
+        const body = { network: params.network, transaction_hash: params.transactionReference };
+        // A supplied assertion is forwarded exactly (even ""), so the backend validates it rather than it vanishing.
+        if (params.expected?.recipient !== undefined)
+            body.expected_recipient = params.expected.recipient;
+        if (params.expected?.asset !== undefined)
+            body.expected_asset = params.expected.asset;
+        if (params.expected?.amount !== undefined)
+            body.expected_amount = params.expected.amount;
+        const res = await this.apiFetch('/observe-payment', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) });
+        const retryAfter = Number(res.headers.get('retry-after'));
+        const retryAfterSeconds = Number.isFinite(retryAfter) && retryAfter > 0 ? retryAfter : null;
+        if (res.status === 200) {
+            const envelope = (await res.json());
+            const receipt = envelope?.receipt;
+            const reference = receipt?.execution?.transaction_hash ?? '';
+            const sameReference = params.network.startsWith('eip155:') ? reference.toLowerCase() === params.transactionReference.toLowerCase() : reference === params.transactionReference;
+            if (!receipt || receipt.action?.network !== params.network || !sameReference) {
+                throw new Error('observe-payment returned a receipt that does not match the requested network and transaction reference');
+            }
+            return { kind: 'receipt', receipt: envelope, existing: res.headers.get('x-ocd-existing-receipt') === 'true' };
+        }
+        if (res.status === 400)
+            return { kind: 'rejected', message: await this.readError(res) };
+        if (res.status === 425 || res.status === 503 || res.status === 429) {
+            let error = {};
+            try {
+                error = (await res.json());
+            }
+            catch { /* no body */ }
+            const reason = res.status === 429
+                ? 'rate-limited'
+                : error.reason === 'transaction-not-found' || error.reason === 'insufficient-confirmations'
+                    ? error.reason
+                    : 'observation-unavailable';
+            return { kind: 'pending', reason, message: error.error || `HTTP ${res.status}`, retryAfterSeconds };
+        }
+        throw new Error(`observe-payment failed: ${await this.readError(res)}`);
+    }
 }
 export function createCommerceClient(options) {
     return new OnchainDiligenceCommerceClient(options);

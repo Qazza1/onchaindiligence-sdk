@@ -106,6 +106,27 @@ free `/observe-payment` endpoint and returns a signed
 `UNKNOWN`, no preflight link, and no authorization claim. It is never used
 after any preflight attempt or finalization failure.
 
+### Receipt for a payment that already happened
+
+`observePayment()` calls OCD's free `POST /observe-payment`. No operation,
+preflight, account or payment is needed. OCD independently observes the
+transaction and returns a signed, observation-only receipt. Its decision is
+`UNKNOWN`: it makes no claim that the payment was authorized.
+
+```ts
+const result = await ocd.observePayment({ network: 'eip155:8453', transactionReference: txHash })
+if (result.kind === 'receipt') console.log(result.receipt.receipt.settlement.status) // read the fact; existence is not success
+else if (result.kind === 'pending') retryLater(result.retryAfterSeconds) // not found / not final yet -- not a failure
+```
+
+Supported networks are the same as the endpoint's: `eip155:8453` (Base
+USDC), `eip155:1` (Ethereum USDC), `eip155:4217` (Tempo pathUSD) and
+`solana:mainnet` (Solana USDC). If a receipt already exists for the
+transaction, that receipt is returned (`existing: true`). Receipts are
+unlisted, not private. Anyone can view one at
+`https://onchaindiligence.com/r/<receipt_id>` and verify it there, or
+offline.
+
 Key pieces:
 
 | Export | What it is |
