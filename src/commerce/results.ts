@@ -56,6 +56,32 @@ export type ResumeResult =
   | { kind: 'resumed'; operationId: string; status: OperationStatus }
   | { kind: 'recovery-failed'; reason: string }
 
+/**
+ * Input for OnchainDiligenceCommerceClient.observePayment(): a payment that
+ * already happened, identified by network + transaction reference. `expected`
+ * values are caller assertions only -- OCD compares them against its own chain
+ * observation and never uses them as evidence.
+ */
+export interface ObservePaymentParams {
+  /** OCD settlement network: 'eip155:8453' (Base USDC), 'eip155:1' (Ethereum USDC), 'eip155:4217' (Tempo pathUSD) or 'solana:mainnet' (Solana USDC). */
+  network: string
+  /** EVM transaction hash, or Solana transaction signature. */
+  transactionReference: string
+  expected?: { recipient?: string; asset?: string; amount?: string }
+}
+
+/**
+ * Outcome of observePayment(). `receipt` is a signed, observation-only Public
+ * Action Receipt: its decision is UNKNOWN and it makes no authorization claim;
+ * read `settlement.status`, never infer success from a receipt merely existing.
+ * `pending` means no receipt was issued yet and nothing about the payment was
+ * concluded -- it is not a failure.
+ */
+export type ObservePaymentResult =
+  | { kind: 'receipt'; receipt: ReceiptEnvelope; existing: boolean }
+  | { kind: 'pending'; reason: 'transaction-not-found' | 'insufficient-confirmations' | 'observation-unavailable' | 'rate-limited'; message: string; retryAfterSeconds: number | null }
+  | { kind: 'rejected'; message: string }
+
 export function pending(operationId: string, info: Omit<PendingInfo, 'operationId'>): { kind: 'pending' } & PendingInfo {
   return { kind: 'pending', operationId, ...info }
 }

@@ -17,7 +17,7 @@
 import type { CommerceAction, CommercePolicy, CommercePublication, OperationStatus, ReceiptEnvelope } from './types.js';
 import type { CommerceExecutor } from './executor.js';
 import type { CommerceRecoveryStore, CommerceRecoveryRecord } from './recoveryStore.js';
-import { type PreflightEvaluation, type ExecutionRecord, type FinalizeResult, type ResumeResult } from './results.js';
+import { type PreflightEvaluation, type ExecutionRecord, type FinalizeResult, type ResumeResult, type ObservePaymentParams, type ObservePaymentResult } from './results.js';
 import { type EvidenceExportManifest } from './evidenceExport.js';
 /**
  * D2.6 review fix #1: thrown by execute() whenever the operation's
@@ -105,6 +105,13 @@ export declare class OnchainDiligenceCommerceClient {
     }>;
     /** D2.5 Section 7: free, structured lookup by exact receipt id. */
     getReceipt(receiptId: string): Promise<ReceiptEnvelope | null>;
+    /**
+     * Free observation-only receipt for a payment that already happened, via
+     * the existing POST /observe-payment. Needs no operation, recovery store
+     * entry or payment. OCD independently observes the chain; a transaction
+     * that already has a receipt returns that receipt (`existing: true`).
+     */
+    observePayment(params: ObservePaymentParams): Promise<ObservePaymentResult>;
 }
 export declare function createCommerceClient(options: CreateCommerceClientOptions): OnchainDiligenceCommerceClient;
 export declare class CommerceOperation {
