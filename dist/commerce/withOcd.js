@@ -8,6 +8,15 @@ export class OcdPaymentPolicyError extends Error {
         this.name = 'OcdPaymentPolicyError';
     }
 }
+/**
+ * x402 v2 §9 `settlement_pending`: the settlement transaction was broadcast
+ * but its confirmation could not be established. Non-terminal -- funds may
+ * still move. @x402/core carries it only as a `SettleResponse.errorReason`
+ * string (its own SETTLEMENT_PENDING_REASON constant is not exported).
+ */
+const X402_SETTLEMENT_PENDING = 'settlement_pending';
+/** Emitted when a pending settlement carries no reference OCD could observe. */
+const SETTLEMENT_PENDING_UNOBSERVABLE = 'settlement-pending-payment-may-have-occurred';
 /** A one-shot promise that lets the x402 hook wait only until the binding exists. */
 function deferred() {
     let resolve;
@@ -43,7 +52,16 @@ class DeferredX402Executor {
         this.bindingRegistered.resolve();
         const settlement = await this.settlement.promise;
         if (settlement.kind === 'transaction-known') {
+            // Also used for a pending settlement: the broadcast reference is known,
+            // settlement is not. OCD's finalization observes it independently.
             return { clientSubmissionKey: prepared.clientSubmissionKey, status: 'transaction-known', transactionHash: settlement.transactionHash };
+        }
+        if (settlement.kind === 'settlement-pending-unobservable') {
+            return {
+                clientSubmissionKey: prepared.clientSubmissionKey,
+                status: 'submission-ambiguous',
+                reason: 'x402 settlement is pending without an observable reference; the payment may already have occurred -- inspect the payer or merchant, never pay again',
+            };
         }
         return { clientSubmissionKey: prepared.clientSubmissionKey, status: 'manual-recovery-required', reason: settlement.reason };
     }
@@ -67,21 +85,35 @@ class DeferredX402Executor {
         this.settlement.resolve(result);
     }
 }
+/** Keyed by the network identifier OCD's settlement observers expect. */
 const CANONICAL_ASSETS = {
     'eip155:8453': '0x833589fcd6edb6e08f4c7c32d4f71b54bda02913',
     'eip155:1': '0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48',
     'eip155:4217': '0x20c0000000000000000000000000000000000000',
     'solana:mainnet': 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v',
 };
-function isCanonicalRequirement(requirements) {
-    const expected = CANONICAL_ASSETS[requirements.network];
+/**
+ * x402 network identifier -> OCD observer network identifier. x402 v2 uses
+ * the CAIP-2 genesis-hash reference for Solana mainnet (spec §11.1); OCD's
+ * Solana observer is keyed `solana:mainnet`. Every other identifier passes
+ * through unchanged.
+ */
+const X402_TO_OCD_NETWORK = {
+    'solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp': 'solana:mainnet',
+};
+function ocdNetwork(x402Network) {
+    return X402_TO_OCD_NETWORK[x402Network] ?? x402Network;
+}
+/** null when in OCD observation scope; otherwise the precise reason it is not. */
+function outOfScopeReason(requirements) {
+    const network = ocdNetwork(requirements.network);
+    const expected = CANONICAL_ASSETS[network];
     if (expected === undefined)
-        return false;
+        return `network ${requirements.network} is not a supported OCD settlement-observation network`;
     // EVM addresses are case-insensitive. Solana base58 mint identifiers are
     // not: lowercasing one can silently identify a different asset.
-    return requirements.network.startsWith('eip155:')
-        ? requirements.asset.toLowerCase() === expected
-        : requirements.asset === expected;
+    const matches = network.startsWith('eip155:') ? requirements.asset.toLowerCase() === expected : requirements.asset === expected;
+    return matches ? null : `asset ${requirements.asset} is not the canonical observed asset on ${requirements.network}`;
 }
 function decimalAmount(atomic) {
     if (!/^\d+$/.test(atomic))
@@ -105,11 +137,19 @@ function settlementTransaction(context) {
         return { kind: 'no-receipt', reason: 'payment-response-error' };
     if (!context.settleResponse)
         return { kind: 'no-receipt', reason: 'settlement-response-missing' };
-    if (!context.settleResponse.success)
+    if (!context.settleResponse.success) {
+        // Pending is not failure: keep any broadcast reference for independent
+        // observation, and never report it as payment-failed.
+        if (context.settleResponse.errorReason === X402_SETTLEMENT_PENDING) {
+            return context.settleResponse.transaction
+                ? { kind: 'transaction-known', transactionHash: context.settleResponse.transaction, pending: true }
+                : { kind: 'settlement-pending-unobservable' };
+        }
         return { kind: 'no-receipt', reason: 'payment-failed' };
+    }
     if (!context.settleResponse.transaction)
         return { kind: 'no-receipt', reason: 'settlement-response-missing' };
-    return { kind: 'transaction-known', transactionHash: context.settleResponse.transaction };
+    return { kind: 'transaction-known', transactionHash: context.settleResponse.transaction, pending: false };
 }
 function wait(milliseconds) {
     return new Promise((resolve) => setTimeout(resolve, milliseconds));
@@ -142,26 +182,33 @@ export function withOcd(client, options) {
     };
     const observeFallback = async (flow, context) => {
         const settlement = settlementTransaction(context);
+        if (settlement.kind === 'settlement-pending-unobservable') {
+            emit(flow, { kind: 'no-receipt', reason: SETTLEMENT_PENDING_UNOBSERVABLE });
+            return;
+        }
         if (settlement.kind !== 'transaction-known') {
             emit(flow, { kind: 'no-receipt', reason: settlement.reason });
             return;
         }
+        // A pending settlement that is not yet observable must not read as a
+        // failed observation: the payment may already have occurred.
+        const unobserved = settlement.pending ? SETTLEMENT_PENDING_UNOBSERVABLE : 'observation-only-failed';
         try {
             const res = await ocd.apiFetch('/observe-payment', {
                 method: 'POST',
                 headers: { 'content-type': 'application/json' },
                 // Do not add caller assertions here: selected x402 requirement data is
                 // not an independently established payment fact.
-                body: JSON.stringify({ network: context.requirements.network, transaction_hash: settlement.transactionHash }),
+                body: JSON.stringify({ network: ocdNetwork(context.requirements.network), transaction_hash: settlement.transactionHash }),
             });
             if (!res.ok) {
-                emit(flow, { kind: 'no-receipt', reason: 'observation-only-failed' });
+                emit(flow, { kind: 'no-receipt', reason: unobserved });
                 return;
             }
             emit(flow, { kind: 'post-payment-evidence', receipt: (await res.json()) });
         }
         catch {
-            emit(flow, { kind: 'no-receipt', reason: 'observation-only-failed' });
+            emit(flow, { kind: 'no-receipt', reason: unobserved });
         }
     };
     const finalizationCapabilityExpired = async (operationId) => {
@@ -211,11 +258,12 @@ export function withOcd(client, options) {
         if (sameOrigin(context.paymentRequired.resource.url, baseUrl))
             return;
         const requirements = context.selectedRequirements;
-        if (!isCanonicalRequirement(requirements)) {
+        const outOfScope = outOfScopeReason(requirements);
+        if (outOfScope) {
             const flow = { kind: 'fallback', terminalEmitted: false };
             flows.set(requirements, flow);
             emit(flow, { kind: 'no-receipt', reason: 'unsupported-canonical-asset' });
-            return { abort: true, reason: 'OCD policy enforcement aborted payment creation: selected x402 asset/network is outside OCD independent-observation scope' };
+            return { abort: true, reason: `OCD policy enforcement aborted payment creation: selected x402 requirement is outside OCD independent-observation scope (${outOfScope})` };
         }
         let operation;
         try {
@@ -223,7 +271,7 @@ export function withOcd(client, options) {
                 action: {
                     kind: 'PAYMENT',
                     resource: context.paymentRequired.resource.url,
-                    network: requirements.network,
+                    network: ocdNetwork(requirements.network),
                     asset: requirements.asset,
                     amount: decimalAmount(requirements.amount),
                     sender: null,
@@ -297,10 +345,19 @@ export function withOcd(client, options) {
         flow.paymentResponseHandled = true;
         const settlement = settlementTransaction(context);
         flow.executor.resolveSettlement(settlement);
+        if (settlement.kind === 'settlement-pending-unobservable') {
+            // The operation stays recorded as submission-ambiguous; nothing here
+            // retries or re-submits the payment.
+            emit(flow, { kind: 'no-receipt', reason: SETTLEMENT_PENDING_UNOBSERVABLE, operationId: flow.operation.operationId });
+            return;
+        }
         if (settlement.kind !== 'transaction-known') {
             emit(flow, { kind: 'no-receipt', reason: settlement.reason, operationId: flow.operation.operationId });
             return;
         }
+        // A pending settlement with a broadcast reference continues exactly like a
+        // settled one: the same operation is finalized only once OCD independently
+        // observes the transaction (finalization stays `pending` until then).
         // Do not hold the merchant HTTP response open for independently observed
         // chain finality. The recovery store holds the operation for later retry.
         void flow.execution

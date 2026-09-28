@@ -374,3 +374,141 @@ test('withOcd: a terminal callback is attempted once for repeated response-hook 
     assert.equal(attempts, 1)
   } finally { fake.restore() }
 })
+
+// ---------------------------------------------------------------------------
+// x402 v2 correctness (2026-09-28 review): settlement_pending and the
+// canonical x402 Solana network identifier.
+// ---------------------------------------------------------------------------
+
+const X402_SOLANA = 'solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp'
+const SOLANA_USDC = 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v'
+const SOLANA_RECIPIENT = '9WzDXwBbmkg8ZTbNMqUxvQRAyrZzDsGYdLVL9zYtAWWM'
+const preflightAction = (fake) => JSON.parse(fake.calls.find((x) => x.url.endsWith('/x402/lifecycle/preflight-payment')).body).action
+
+test('withOcd: settlement_pending with a broadcast transaction is not payment-failed and finalizes the same operation once observed', async () => {
+  const fake = installOcdFetch({ finalize: 'pending-once' })
+  try {
+    // Distinctive broadcast reference: any substitution (e.g. the shared TX fixture) is obvious.
+    const BROADCAST_TX = '0x5e771e3e17d1e6d1ab0ad0ca57c0ffee' + '0123456789abcdef'.repeat(2)
+    const store = new InMemoryRecoveryStore(); const client = new HookClient(); const received = []
+    withOcd(client, { policy, store, onReceipt: (result) => received.push(result) })
+    const selected = requirement('settle-pending-tx')
+    await client.before[0](context(selected))
+    const hookResult = await client.responses[0](response(selected, { success: false, errorReason: 'settlement_pending', transaction: BROADCAST_TX, network: 'eip155:8453' }))
+    assert.equal(hookResult, undefined, 'the response hook must never ask x402 to recover/retry the payment')
+    await flush(40)
+    assert.equal(received.some((x) => x.reason === 'payment-failed'), false)
+    assert.deepEqual(received.map((x) => x.kind), ['full-lifecycle'])
+    assert.equal(received[0].operationId, 'op-1')
+    assert.equal(fake.finalizeCalls, 2, 'finalization waits (pending) until OCD independently observes the transaction')
+    assert.equal((await store.load('op-1')).transactionHash, BROADCAST_TX, 'the recovery/execution record keeps the exact x402 broadcast reference')
+    const finalizeBodies = fake.calls.filter((x) => x.url.endsWith('/operations/op-1/finalize')).map((x) => JSON.parse(x.body))
+    assert.equal(finalizeBodies.length, 2)
+    assert.ok(finalizeBodies.every((body) => body.transaction_hash === BROADCAST_TX), 'every finalization of the same operation sends that exact reference')
+    assert.equal(fake.calls.filter((x) => x.url.endsWith('/operations')).length, 1)
+    assert.equal(fake.calls.filter((x) => x.url.endsWith('/execution-bindings')).length, 1)
+  } finally { fake.restore() }
+})
+
+test('withOcd: settlement_pending without a reference reports that payment may have occurred and never re-submits or finalizes', async () => {
+  const fake = installOcdFetch()
+  try {
+    const store = new InMemoryRecoveryStore(); const client = new HookClient(); const received = []
+    withOcd(client, { policy, store, onReceipt: (result) => received.push(result) })
+    const selected = requirement('settle-pending-no-tx')
+    await client.before[0](context(selected))
+    const pending = response(selected, { success: false, errorReason: 'settlement_pending', transaction: '', network: 'eip155:8453' })
+    assert.equal(await client.responses[0](pending), undefined)
+    await client.responses[0](pending)
+    await flush(30)
+    assert.deepEqual(received, [{ kind: 'no-receipt', reason: 'settlement-pending-payment-may-have-occurred', operationId: 'op-1' }])
+    assert.equal(fake.finalizeCalls, 0, 'nothing observable: no settlement is claimed')
+    assert.equal(fake.calls.filter((x) => x.url.endsWith('/operations')).length, 1)
+    assert.equal(fake.calls.filter((x) => x.url.endsWith('/execution-bindings')).length, 1)
+    const record = await store.load('op-1')
+    assert.equal(record.localPhase, 'execution-ambiguous', 'recorded as possibly paid, not failed')
+  } finally { fake.restore() }
+})
+
+test('withOcd: a non-pending unsuccessful settlement is still payment-failed', async () => {
+  const fake = installOcdFetch()
+  try {
+    const client = new HookClient(); const received = []
+    withOcd(client, { policy, onReceipt: (result) => received.push(result) })
+    const selected = requirement('settle-failed-reason')
+    await client.before[0](context(selected))
+    await client.responses[0](response(selected, { success: false, errorReason: 'insufficient_funds', transaction: '', network: 'eip155:8453' }))
+    await flush()
+    assert.equal(received[0].reason, 'payment-failed')
+  } finally { fake.restore() }
+})
+
+test('withOcd: the canonical x402 Solana network maps to the OCD Solana observer identifier', async () => {
+  const fake = installOcdFetch()
+  try {
+    const client = new HookClient()
+    withOcd(client, { policy, onReceipt: () => {} })
+    const selected = requirement('x402-solana', { network: X402_SOLANA, asset: SOLANA_USDC, payTo: SOLANA_RECIPIENT })
+    assert.equal(await client.before[0](context(selected)), undefined)
+    assert.equal(preflightAction(fake).network, 'solana:mainnet')
+    assert.equal(preflightAction(fake).asset, SOLANA_USDC)
+  } finally { fake.restore() }
+})
+
+test('withOcd: observation-only fallback sends the OCD Solana identifier for an x402 Solana payment', async () => {
+  const fake = installOcdFetch({ openFails: true })
+  try {
+    const client = new HookClient()
+    withOcd(client, { policy, onOcdUnavailable: 'proceed', onReceipt: () => {} })
+    const selected = requirement('x402-solana-fallback', { network: X402_SOLANA, asset: SOLANA_USDC, payTo: SOLANA_RECIPIENT })
+    assert.equal(await client.before[0](context(selected)), undefined)
+    await client.responses[0](response(selected, { success: true, transaction: '5'.repeat(88), network: X402_SOLANA }))
+    await flush(30)
+    const observe = fake.calls.find((x) => x.url.endsWith('/observe-payment'))
+    assert.equal(JSON.parse(observe.body).network, 'solana:mainnet')
+  } finally { fake.restore() }
+})
+
+test('withOcd: the canonical x402 Solana USDC mint still requires an exact case-sensitive match', async () => {
+  const fake = installOcdFetch()
+  try {
+    const client = new HookClient()
+    withOcd(client, { policy, onReceipt: () => {} })
+    const mutated = requirement('x402-solana-mutated', { network: X402_SOLANA, asset: 'epjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v', payTo: SOLANA_RECIPIENT })
+    const blocked = await client.before[0](context(mutated))
+    assert.equal(blocked.abort, true)
+    assert.match(blocked.reason, /asset .* is not the canonical observed asset/)
+    assert.equal(fake.calls.length, 0)
+  } finally { fake.restore() }
+})
+
+for (const network of ['lnbtc:000000000019d6689c085ae165831e93', 'solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1', 'eip155:84532']) {
+  test(`withOcd: unsupported network ${network} fails closed with an accurate network message`, async () => {
+    const fake = installOcdFetch()
+    try {
+      const client = new HookClient(); const received = []
+      withOcd(client, { policy, onReceipt: (result) => received.push(result) })
+      const blocked = await client.before[0](context(requirement(`unsupported-${network}`, { network, asset: 'BTC', payTo: '02' + '11'.repeat(32) })))
+      assert.equal(blocked.abort, true)
+      assert.match(blocked.reason, /network .* is not a supported OCD settlement-observation network/)
+      assert.doesNotMatch(blocked.reason, /0x/)
+      await flush()
+      assert.equal(received[0].reason, 'unsupported-canonical-asset')
+      assert.equal(fake.calls.length, 0)
+    } finally { fake.restore() }
+  })
+}
+
+test('withOcd: the Base x402 v2 exact lifecycle still sends eip155:8453 unchanged', async () => {
+  const fake = installOcdFetch()
+  try {
+    const client = new HookClient(); const received = []
+    withOcd(client, { policy, onReceipt: (result) => received.push(result) })
+    const selected = requirement('base-unchanged')
+    await client.before[0](context(selected))
+    assert.deepEqual(preflightAction(fake), { kind: 'PAYMENT', resource: 'https://merchant.example/paid', network: 'eip155:8453', asset: BASE_USDC, amount: '0.01', sender: null, recipient: '0x0000000000000000000000000000000000000001' })
+    await client.responses[0](response(selected, { success: true, transaction: TX, network: 'eip155:8453' }))
+    await flush()
+    assert.deepEqual(received.map((x) => x.kind), ['full-lifecycle'])
+  } finally { fake.restore() }
+})
