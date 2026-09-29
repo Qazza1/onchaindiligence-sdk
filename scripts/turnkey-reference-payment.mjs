@@ -15,6 +15,7 @@ import { createPublicClient, http, parseAbi, formatUnits } from 'viem'
 import { base } from 'viem/chains'
 import { resolveRunMode, assertMayExecute, loadPaymentConfig, missingCredentials } from './turnkeyReferenceGuards.mjs'
 import { createTurnkeyClient } from './turnkeyClientAdapter.mjs'
+import { probePreflightChallenge } from './turnkeyPreflightProbe.mjs'
 
 const env = process.env
 const line = (label, value) => console.log(`${label.padEnd(24)}${value}`)
@@ -59,15 +60,17 @@ async function readiness(cfg, sdk, turnkeyApi) {
   line('Wallet balance:', `${formatUnits(usdc, 6)} USDC, ${formatUnits(eth, 18)} ETH (gas)`)
   line('Proposed payment:', `${cfg.amount} USDC -> ${cfg.recipient}`)
 
-  const client = createCommerceClient({ endpoint: env.OCD_ENDPOINT, accountApiKey: env.OCD_API_KEY, recovery: new InMemoryRecoveryStore() })
+  const recovery = new InMemoryRecoveryStore()
+  const client = createCommerceClient({ endpoint: env.OCD_ENDPOINT, accountApiKey: env.OCD_API_KEY, recovery })
   const action = { kind: 'PAYMENT', resource: null, network: cfg.network, asset: cfg.asset, amount: cfg.amount, sender: cfg.wallet, recipient: cfg.recipient }
   const policy = { max_amount: cfg.amount, allowed_networks: [cfg.network], allowed_assets: [cfg.asset], expected_recipient: cfg.recipient, allowed_resource_origins: null }
   const op = await client.open({ action, policy })
   line('OCD SDK operation:', `created ${op.operationId} (client source: sdk; workspace-attached)`)
 
-  const endpoint = (env.OCD_ENDPOINT || 'https://mcp.onchaindiligence.com').replace(/\/$/, '')
-  const probe = await fetch(`${endpoint}/x402/lifecycle/preflight-payment`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' })
-  line('Preflight:', probe.status === 402 ? 'paid preflight is live (402 challenge). NOT paid in readiness mode.' : `unexpected HTTP ${probe.status} from preflight probe`)
+  // Unpaid probe for this exact operation/input: valid headers + body, no payment, so the server returns its 402 challenge.
+  const record = await recovery.load(op.operationId)
+  const probe = await probePreflightChallenge({ endpoint: env.OCD_ENDPOINT || 'https://mcp.onchaindiligence.com', operationId: op.operationId, recoveryCredential: record.recoveryCredential, action, policy })
+  line('Preflight:', probe.live ? 'paid preflight is live (402 challenge). NOT paid in readiness mode.' : `unexpected HTTP ${probe.status} from preflight probe`)
   console.log('')
   line('Execution:', 'NOT SUBMITTED')
   line('Transaction:', 'none')
