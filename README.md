@@ -53,6 +53,23 @@ const result = await op.observeAndFinalize() // safe to retry while kind === 'pe
 console.log(result.receipt.receipt.execution.status) // read the fact, never infer "success" from existence
 ```
 
+To have SDK-created operations appear in your private OCD workspace (dashboard → Payments), add your
+workspace API key:
+
+```ts
+const client = createCommerceClient({
+  accountApiKey: process.env.OCD_API_KEY,
+  recovery
+})
+
+const operation = await client.open({ action, policy })
+```
+
+The key is sent only when a new operation is created. It does **not** authorize wallet spending, is
+separate from recovery credentials (never written to the recovery store), and is not agent identity.
+The SDK also declares itself as the operation's client (`OCD SDK` in the dashboard); that is client
+metadata, separate from signed agent identity/provenance.
+
 See **[examples/quickstart.ts](examples/quickstart.ts)** for the complete,
 runnable, ~20-line integration (uses a mocked executor and an in-process demo
 server — `npx tsx examples/quickstart.ts` costs nothing and needs no wallet).

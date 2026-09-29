@@ -81,6 +81,7 @@ export class OnchainDiligenceCommerceClient {
     recovery;
     fetchImpl;
     trust;
+    accountApiKey;
     constructor(options) {
         this.endpoint = (options.endpoint ?? DEFAULT_ENDPOINT).replace(/\/$/, '');
         this.recovery = options.recovery;
@@ -93,6 +94,7 @@ export class OnchainDiligenceCommerceClient {
         // in both a browser and Node without the caller ever having to know.
         this.fetchImpl = options.fetch ?? globalThis.fetch.bind(globalThis);
         this.trust = options.trust ?? {};
+        this.accountApiKey = options.accountApiKey?.trim() || undefined;
     }
     /** @internal */
     async apiFetch(path, init = {}) {
@@ -127,7 +129,13 @@ export class OnchainDiligenceCommerceClient {
             }
             throw new RecoveryRequiredError(params.operationId);
         }
-        const res = await this.apiFetch('/operations', { method: 'POST' });
+        // `client_source: 'sdk'` is client-declared transport metadata (not agent identity). The workspace
+        // key, if configured, is attached to this one request only.
+        const res = await this.apiFetch('/operations', {
+            method: 'POST',
+            headers: { 'content-type': 'application/json', ...(this.accountApiKey ? { authorization: `Bearer ${this.accountApiKey}` } : {}) },
+            body: JSON.stringify({ client_source: 'sdk' }),
+        });
         if (!res.ok)
             throw new Error(`failed to create operation: ${await this.readError(res)}`);
         const created = (await res.json());
