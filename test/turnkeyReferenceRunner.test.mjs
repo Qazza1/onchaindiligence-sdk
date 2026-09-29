@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+import { readFileSync } from 'node:fs'
 import test from 'node:test'
 import { resolveRunMode, assertMayExecute, loadPaymentConfig } from '../scripts/turnkeyReferenceGuards.mjs'
 import { createTurnkeyClient } from '../scripts/turnkeyClientAdapter.mjs'
@@ -49,4 +50,13 @@ test('finalize declares execution_provider turnkey for the Turnkey executor, not
   await op.observeAndFinalize().catch(() => {})
   assert.ok(body, 'finalize was reached')
   assert.equal(body.execution_provider, 'turnkey')
+})
+
+test('execute mode wires x402 exactly like the proven executor: core client import, exact configured network', () => {
+  const runner = readFileSync(new URL('../scripts/turnkey-reference-payment.mjs', import.meta.url), 'utf8')
+  assert.match(runner, /const \{ wrapFetchWithPayment \} = await import\('@x402\/fetch'\)/)
+  assert.match(runner, /const \{ x402Client \} = await import\('@x402\/core\/client'\)/)
+  assert.ok(!runner.includes("{ wrapFetchWithPayment, x402Client }"), 'x402Client is not imported from @x402/fetch')
+  assert.match(runner, /new x402Client\(\)\.register\(cfg\.network, new ExactEvmScheme\(toClientEvmSigner\(buyer\)\)\)/)
+  assert.doesNotMatch(runner, /eip155:\*/)
 })

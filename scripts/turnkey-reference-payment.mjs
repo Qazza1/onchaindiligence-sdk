@@ -78,11 +78,13 @@ async function execute(cfg, sdk, turnkeyApi) {
   const { createCommerceClient, TurnkeyCommerceExecutor } = sdk
   const { NodeFileRecoveryStore } = await import('../dist/commerce/node.js')
   if (!env.OCD_PREFLIGHT_BUYER_KEY) throw new Error('OCD_PREFLIGHT_BUYER_KEY is required in execute mode (x402 buyer that pays the $0.01 preflight)')
-  const { wrapFetchWithPayment, x402Client } = await import('@x402/fetch')
+  const { wrapFetchWithPayment } = await import('@x402/fetch')
+  const { x402Client } = await import('@x402/core/client')
   const { ExactEvmScheme } = await import('@x402/evm/exact/client')
+  const { toClientEvmSigner } = await import('@x402/evm')
   const { privateKeyToAccount } = await import('viem/accounts')
   const buyer = privateKeyToAccount(env.OCD_PREFLIGHT_BUYER_KEY)
-  const paidFetch = wrapFetchWithPayment(globalThis.fetch, new x402Client().register('eip155:*', new ExactEvmScheme(sdk.toClientEvmSigner ? sdk.toClientEvmSigner(buyer) : buyer)))
+  const paidFetch = wrapFetchWithPayment(globalThis.fetch, new x402Client().register(cfg.network, new ExactEvmScheme(toClientEvmSigner(buyer))))
   const client = createCommerceClient({ endpoint: env.OCD_ENDPOINT, accountApiKey: env.OCD_API_KEY, fetch: paidFetch, recovery: new NodeFileRecoveryStore('./ocd-recovery') })
   const action = { kind: 'PAYMENT', resource: null, network: cfg.network, asset: cfg.asset, amount: cfg.amount, sender: cfg.wallet, recipient: cfg.recipient }
   const policy = { max_amount: cfg.amount, allowed_networks: [cfg.network], allowed_assets: [cfg.asset], expected_recipient: cfg.recipient, allowed_resource_origins: null }
