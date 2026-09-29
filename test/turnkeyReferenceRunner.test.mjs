@@ -3,6 +3,7 @@ import { readFileSync } from 'node:fs'
 import test from 'node:test'
 import { resolveRunMode, assertMayExecute, loadPaymentConfig } from '../scripts/turnkeyReferenceGuards.mjs'
 import { createTurnkeyClient } from '../scripts/turnkeyClientAdapter.mjs'
+import { probePreflightChallenge } from '../scripts/turnkeyPreflightProbe.mjs'
 import { createCommerceClient, InMemoryRecoveryStore, TurnkeyCommerceExecutor, InMemoryTurnkeyRequestStore } from '../dist/commerce/index.js'
 import { createFakeServer } from './fakeServer.mjs'
 
@@ -59,4 +60,22 @@ test('execute mode wires x402 exactly like the proven executor: core client impo
   assert.ok(!runner.includes("{ wrapFetchWithPayment, x402Client }"), 'x402Client is not imported from @x402/fetch')
   assert.match(runner, /new x402Client\(\)\.register\(cfg\.network, new ExactEvmScheme\(toClientEvmSigner\(buyer\)\)\)/)
   assert.doesNotMatch(runner, /eip155:\*/)
+})
+
+test('readiness probe supplies operation headers and a valid preflight body, and no payment authorization', async () => {
+  const seen = []
+  const fetchImpl = async (url, init) => { seen.push({ url, init }); return new Response('{}', { status: 402 }) }
+  const action = { kind: 'PAYMENT', network: 'eip155:8453' }; const policy = { max_amount: '0.001' }
+  const result = await probePreflightChallenge({ endpoint: 'https://mcp.example/', operationId: 'OCD-OP-x', recoveryCredential: 'cred-x', action, policy, fetchImpl })
+  assert.deepEqual(result, { status: 402, live: true })
+  const { url, init } = seen[0]
+  assert.equal(url, 'https://mcp.example/x402/lifecycle/preflight-payment')
+  assert.equal(init.headers['x-ocd-operation-id'], 'OCD-OP-x'); assert.equal(init.headers['x-ocd-recovery-credential'], 'cred-x')
+  assert.deepEqual(JSON.parse(init.body), { action, policy, options: {}, references: {}, publication: {} })
+  const names = Object.keys(init.headers).map((h) => h.toLowerCase())
+  assert.ok(!names.some((h) => h.includes('payment') || h === 'authorization'), 'no x402 payment authorization')
+  const runner = readFileSync(new URL('../scripts/turnkey-reference-payment.mjs', import.meta.url), 'utf8')
+  const readinessBody = runner.slice(runner.indexOf('async function readiness'), runner.indexOf('async function execute'))
+  assert.match(readinessBody, /probePreflightChallenge\(/)
+  assert.doesNotMatch(readinessBody, /OCD_PREFLIGHT_BUYER_KEY|wrapFetchWithPayment|TurnkeyCommerceExecutor|ethSendTransaction|sendTransaction/)
 })
