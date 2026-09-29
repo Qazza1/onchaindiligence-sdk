@@ -146,7 +146,7 @@ export interface ExecutionBindingResponse {
 
 export interface FinalizeExecutionInput {
   transaction_hash: string
-  execution_provider: 'x402' | 'paybox' | 'wallet' | 'other'
+  execution_provider: 'x402' | 'paybox' | 'turnkey' | 'wallet' | 'other'
   provider_reference?: string | null
   result_digest?: string | null
   execution_request_id?: string | null

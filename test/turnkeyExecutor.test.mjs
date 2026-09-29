@@ -59,6 +59,18 @@ test('submit() calls sendTransaction exactly once and attaches the durable provi
   assert.equal(outcome.providerReference, 'turnkey:sts_fixed')
 })
 
+test('submit() sends an ERC-20 USDC transfer to the token contract, never native value to the recipient', async () => {
+  const turnkey = new FakeTurnkeyClient()
+  const executor = new TurnkeyCommerceExecutor({ turnkey, store: new InMemoryTurnkeyRequestStore() })
+  const prepared = await executor.prepare({ clientSubmissionKey: 'attempt-erc20', action: ACTION })
+  await executor.submit(prepared)
+  const call = turnkey.sendTransactionCalls[0]
+  assert.equal(call.to.toLowerCase(), ACTION.asset.toLowerCase())
+  assert.equal(call.value, '0')
+  assert.match(call.data, /^0xa9059cbb/, 'transfer(address,uint256) selector')
+  assert.ok(call.data.toLowerCase().includes(ACTION.recipient.slice(2).toLowerCase()), 'calldata carries the recipient')
+})
+
 test('a BROADCASTING send is polled via getTransactionStatus, never resent via sendTransaction', async () => {
   const turnkey = new FakeTurnkeyClient()
   const executor = new TurnkeyCommerceExecutor({ turnkey, store: new InMemoryTurnkeyRequestStore() })
