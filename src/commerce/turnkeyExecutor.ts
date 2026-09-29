@@ -73,11 +73,13 @@
  *     explicitly rather than silently retrying (which could send a SECOND
  *     transaction for the same intended payment).
  */
-import { createPublicClient, http } from 'viem'
+import { createPublicClient, encodeFunctionData, http, parseAbi } from 'viem'
 import { base } from 'viem/chains'
 import type { CommerceExecutor, PrepareContext, PrepareResult, ExecutionResult, ExecutorRecoveryMode } from './executor.js'
 import { BASE_NETWORK, BASE_USDC, type MinimalResumeClient } from './x402Executor.js'
 import { decimalToAtomic6 } from './x402Challenge.js'
+
+const ERC20_TRANSFER_ABI = parseAbi(['function transfer(address to, uint256 amount) returns (bool)'])
 
 export { BASE_NETWORK as TURNKEY_BASE_NETWORK, BASE_USDC as TURNKEY_BASE_USDC }
 
@@ -288,10 +290,13 @@ export class TurnkeyCommerceExecutor implements CommerceExecutor {
     // We won the claim -- exactly this call may proceed to Turnkey. This IS
     // Turnkey's own independent custody/policy check (organization/user
     // signing policy is entirely Turnkey's, not OCD's).
+    // A USDC payment is an ERC-20 transfer(recipient, amount) call to the token contract with zero native
+    // value. (Sending `value` to the recipient would move native ETH, not USDC.)
     const { sendTransactionStatusId } = await this.turnkey.sendTransaction({
       from: ref.from,
-      to: ref.recipient,
-      value: ref.atomicAmount,
+      to: ref.asset,
+      value: '0',
+      data: encodeFunctionData({ abi: ERC20_TRANSFER_ABI, functionName: 'transfer', args: [ref.recipient as `0x${string}`, BigInt(ref.atomicAmount)] }),
       caip2: ref.network,
     })
 

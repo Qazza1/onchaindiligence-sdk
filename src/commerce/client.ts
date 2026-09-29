@@ -107,9 +107,10 @@ export interface OpenParams {
   publication?: CommercePublication
 }
 
-function mapExecutorIdToProvider(executorId: string | null): 'x402' | 'paybox' | 'wallet' | 'other' {
+function mapExecutorIdToProvider(executorId: string | null): 'x402' | 'paybox' | 'turnkey' | 'wallet' | 'other' {
   if (executorId === 'x402-base-usdc-exact' || executorId === 'x402-v2-deferred-client') return 'x402'
   if (executorId === 'paybox-x402-base-usdc') return 'paybox'
+  if (executorId === 'turnkey-base-usdc') return 'turnkey'
   return 'other'
 }
 
