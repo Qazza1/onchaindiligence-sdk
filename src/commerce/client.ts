@@ -86,6 +86,14 @@ export interface CreateCommerceClientOptions {
   recovery: CommerceRecoveryStore
   /** When verifyReceipts is true, receipts returned by preflight/finalize are additionally checked via the free /verify-receipt endpoint (D2.5 Section 7) before being surfaced. Off by default: verification is a distinct concern a caller can invoke on its own via client.verifyReceipt(). */
   trust?: { verifyReceipts?: boolean }
+  /**
+   * Optional OCD workspace API key (dashboard -> Settings -> API keys). When set, NEW operations
+   * created by open() are attached to your private OCD workspace so they appear in your dashboard.
+   * Sent only as `Authorization: Bearer` on POST /operations -- never on receipt lookups, verification,
+   * or any later lifecycle call, and never stored in recovery records. It does NOT authorize wallet
+   * spending and is unrelated to recovery credentials or agent identity.
+   */
+  accountApiKey?: string
   fetch?: typeof globalThis.fetch
 }
 
@@ -128,6 +136,7 @@ export class OnchainDiligenceCommerceClient {
   private readonly recovery: CommerceRecoveryStore
   private readonly fetchImpl: typeof globalThis.fetch
   private readonly trust: { verifyReceipts?: boolean }
+  private readonly accountApiKey: string | undefined
 
   constructor(options: CreateCommerceClientOptions) {
     this.endpoint = (options.endpoint ?? DEFAULT_ENDPOINT).replace(/\/$/, '')
@@ -141,6 +150,7 @@ export class OnchainDiligenceCommerceClient {
     // in both a browser and Node without the caller ever having to know.
     this.fetchImpl = options.fetch ?? globalThis.fetch.bind(globalThis)
     this.trust = options.trust ?? {}
+    this.accountApiKey = options.accountApiKey?.trim() || undefined
   }
 
   /** @internal */
@@ -180,7 +190,13 @@ export class OnchainDiligenceCommerceClient {
       throw new RecoveryRequiredError(params.operationId)
     }
 
-    const res = await this.apiFetch('/operations', { method: 'POST' })
+    // `client_source: 'sdk'` is client-declared transport metadata (not agent identity). The workspace
+    // key, if configured, is attached to this one request only.
+    const res = await this.apiFetch('/operations', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', ...(this.accountApiKey ? { authorization: `Bearer ${this.accountApiKey}` } : {}) },
+      body: JSON.stringify({ client_source: 'sdk' }),
+    })
     if (!res.ok) throw new Error(`failed to create operation: ${await this.readError(res)}`)
     const created = (await res.json()) as { operation_id: string; recovery_credential: string }
 

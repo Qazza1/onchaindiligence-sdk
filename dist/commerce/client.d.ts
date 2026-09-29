@@ -64,6 +64,14 @@ export interface CreateCommerceClientOptions {
     trust?: {
         verifyReceipts?: boolean;
     };
+    /**
+     * Optional OCD workspace API key (dashboard -> Settings -> API keys). When set, NEW operations
+     * created by open() are attached to your private OCD workspace so they appear in your dashboard.
+     * Sent only as `Authorization: Bearer` on POST /operations -- never on receipt lookups, verification,
+     * or any later lifecycle call, and never stored in recovery records. It does NOT authorize wallet
+     * spending and is unrelated to recovery credentials or agent identity.
+     */
+    accountApiKey?: string;
     fetch?: typeof globalThis.fetch;
 }
 export interface OpenParams {
@@ -80,6 +88,7 @@ export declare class OnchainDiligenceCommerceClient {
     private readonly recovery;
     private readonly fetchImpl;
     private readonly trust;
+    private readonly accountApiKey;
     constructor(options: CreateCommerceClientOptions);
     /** @internal */
     apiFetch(path: string, init?: RequestInit): Promise<Response>;
