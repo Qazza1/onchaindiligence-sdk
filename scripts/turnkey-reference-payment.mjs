@@ -16,6 +16,7 @@ import { base } from 'viem/chains'
 import { resolveRunMode, assertMayExecute, loadPaymentConfig, missingCredentials } from './turnkeyReferenceGuards.mjs'
 import { createTurnkeyClient } from './turnkeyClientAdapter.mjs'
 import { probePreflightChallenge } from './turnkeyPreflightProbe.mjs'
+import { FileReferenceRunState, runReferencePayment } from './turnkeyReferenceRun.mjs'
 
 const env = process.env
 const line = (label, value) => console.log(`${label.padEnd(24)}${value}`)
@@ -89,19 +90,14 @@ async function execute(cfg, sdk, turnkeyApi) {
   const buyer = privateKeyToAccount(env.OCD_PREFLIGHT_BUYER_KEY)
   const paidFetch = wrapFetchWithPayment(globalThis.fetch, new x402Client().register(cfg.network, new ExactEvmScheme(toClientEvmSigner(buyer))))
   const client = createCommerceClient({ endpoint: env.OCD_ENDPOINT, accountApiKey: env.OCD_API_KEY, fetch: paidFetch, recovery: new NodeFileRecoveryStore('./ocd-recovery') })
-  const action = { kind: 'PAYMENT', resource: null, network: cfg.network, asset: cfg.asset, amount: cfg.amount, sender: cfg.wallet, recipient: cfg.recipient }
-  const policy = { max_amount: cfg.amount, allowed_networks: [cfg.network], allowed_assets: [cfg.asset], expected_recipient: cfg.recipient, allowed_resource_origins: null }
-  const op = await client.open({ action, policy })
-  line('OCD operation:', op.operationId)
-  const evaluation = await op.preflight()
-  line('Preflight:', evaluation.kind)
-  if (evaluation.kind !== 'ready') { line('Execution:', 'NOT SUBMITTED (preflight did not allow)'); return }
-  const executor = new TurnkeyCommerceExecutor({ turnkey: createTurnkeyClient(turnkeyApi), store: new FileTurnkeyRequestStore('./ocd-turnkey-requests.json') })
-  const execution = await op.execute({ executor })
-  line('Execution:', execution.kind)
-  if (execution.kind === 'execution-recorded') line('Transaction:', execution.transactionHash)
-  const result = await op.observeAndFinalize()
-  line('Finalize:', result.kind)
+  const executor = new TurnkeyCommerceExecutor({ turnkey: createTurnkeyClient(turnkeyApi), store: new FileTurnkeyRequestStore(env.TURNKEY_REFERENCE_REQUEST_STORE || './ocd-turnkey-requests.json') })
+  const state = new FileReferenceRunState(env.TURNKEY_REFERENCE_STATE_FILE || './ocd-turnkey-reference-run.json')
+  // Restart-safe: the first run records the operation; any rerun resumes it and never opens, pays or sends a second time.
+  const result = await runReferencePayment({ cfg, client, executor, state })
+  line('OCD operation:', result.operationId ?? '(none)')
+  line('Result:', result.kind + (result.phase ? ` (${result.phase})` : '') + (result.evaluation ? ` (preflight ${result.evaluation})` : ''))
+  if (result.receiptId) line('Receipt:', result.receiptId)
+  if (result.kind === 'pending') line('Next:', `rerun the same command to continue observation${result.retryAfterSeconds ? ` after ~${result.retryAfterSeconds}s` : ''}; it will NOT create or pay anything new`)
 }
 
 async function main() {
