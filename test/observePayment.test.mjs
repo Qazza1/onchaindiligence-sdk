@@ -89,3 +89,31 @@ test('supplied expectations are forwarded exactly, including empty strings; omit
   const sent = JSON.parse(exact.calls[0].init.body)
   assert.equal(sent.expected_recipient, values.recipient); assert.equal(sent.expected_asset, values.asset); assert.equal(sent.expected_amount, values.amount)
 })
+
+test('Arc needs no client-side branch: it is forwarded like every other network and keeps UNKNOWN semantics', async () => {
+  const ARC_TX = '0x' + '47'.repeat(32)
+  const arc = receipt({
+    action: { ...receipt().receipt.action, network: 'eip155:5042', asset: '0xfffffffffffffffffffffffffffffffffffffffe' },
+    execution: { ...receipt().receipt.execution, transaction_hash: ARC_TX },
+  })
+  const { calls, ocd } = client(200, arc, { 'x-ocd-existing-receipt': 'true' })
+  const result = await ocd.observePayment({ network: 'eip155:5042', transactionReference: ARC_TX })
+  assert.equal(result.kind, 'receipt'); assert.equal(result.existing, true); assert.deepEqual(result.receipt, arc)
+  assert.equal(result.receipt.receipt.decision.status, 'UNKNOWN'); assert.equal(result.receipt.receipt.decision.authorized, null)
+  assert.equal(result.receipt.receipt.execution.provider, null); assert.equal(result.receipt.receipt.links.agent_evidence_bundle_digest, null)
+  assert.equal(calls.length, 1); assert.equal(calls[0].url, 'https://mcp.onchaindiligence.com/observe-payment')
+  assert.deepEqual(JSON.parse(calls[0].init.body), { network: 'eip155:5042', transaction_hash: ARC_TX })
+  const pending = await client(425, { error: 'not final', reason: 'insufficient-confirmations' }, { 'retry-after': '10' }).ocd.observePayment({ network: 'eip155:5042', transactionReference: ARC_TX })
+  assert.deepEqual(pending, { kind: 'pending', reason: 'insufficient-confirmations', message: 'not final', retryAfterSeconds: 10 })
+  await assert.rejects(client(200, receipt()).ocd.observePayment({ network: 'eip155:5042', transactionReference: TX }), /does not match/, 'a Base receipt is never returned for an Arc request')
+})
+
+test('the observation client adds no wallet or execution method, and the README documents all five networks as observation-only', async () => {
+  const ocd = client(200, receipt()).ocd
+  for (const name of ['sendPayment', 'submitPayment', 'signTransaction', 'executePayment', 'createPaymentReceipt']) assert.equal(typeof ocd[name], 'undefined', name)
+  const { readFileSync } = await import('node:fs')
+  const readme = readFileSync(new URL('../README.md', import.meta.url), 'utf8')
+  for (const id of ['eip155:8453', 'eip155:1', 'eip155:4217', 'eip155:5042', 'solana:mainnet']) assert.ok(readme.includes('`' + id + '`'), id)
+  assert.match(readme, /Arc is observation-only here/); assert.match(readme, /native USDC system Transfer\s+stream at 18-decimal precision/)
+  assert.match(readme, /not an ordinary ERC-20 token contract/)
+})
