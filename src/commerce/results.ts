@@ -63,7 +63,10 @@ export type ResumeResult =
  * observation and never uses them as evidence.
  */
 export interface ObservePaymentParams {
-  /** OCD settlement network: 'eip155:8453' (Base USDC), 'eip155:1' (Ethereum USDC), 'eip155:4217' (Tempo pathUSD) or 'solana:mainnet' (Solana USDC). */
+  /**
+   * OCD settlement network, validated by the server (not by this client): 'eip155:8453' (Base USDC), 'eip155:1' (Ethereum USDC),
+   * 'eip155:4217' (Tempo pathUSD), 'eip155:5042' (Arc USDC, observation only) or 'solana:mainnet' (Solana USDC).
+   */
   network: string
   /** EVM transaction hash, or Solana transaction signature. */
   transactionReference: string

@@ -136,11 +136,32 @@ if (result.kind === 'receipt') console.log(result.receipt.receipt.settlement.sta
 else if (result.kind === 'pending') retryLater(result.retryAfterSeconds) // not found / not final yet -- not a failure
 ```
 
-Supported networks are the same as the endpoint's: `eip155:8453` (Base
-USDC), `eip155:1` (Ethereum USDC), `eip155:4217` (Tempo pathUSD) and
-`solana:mainnet` (Solana USDC). If a receipt already exists for the
-transaction, that receipt is returned (`existing: true`). Receipts are
-unlisted, not private. Anyone can view one at
+Supported networks are the same as the endpoint's: Base, Ethereum, Tempo, Arc
+and Solana. `network` is a CAIP-2 string that the server validates; the client
+has no network list of its own.
+
+| Network | `network` | Asset |
+|---|---|---|
+| Base | `eip155:8453` | USDC |
+| Ethereum | `eip155:1` | USDC |
+| Tempo | `eip155:4217` | pathUSD |
+| Arc | `eip155:5042` | USDC |
+| Solana | `solana:mainnet` | USDC |
+
+```ts
+await ocd.observePayment({ network: 'eip155:5042', transactionReference: '0x<arc transaction hash>' })
+```
+
+Arc is observation-only here: OCD reads Arc's native USDC system Transfer
+stream at 18-decimal precision, for a transaction at or below the finalized
+(committed) head. That stream is not an ordinary ERC-20 token contract. A
+transaction that is not found or not yet finalized returns `kind: 'pending'`:
+retry the same call, never the payment.
+
+A receipt for a payment without a preflight has decision `UNKNOWN`. It does
+not prove authorization, agent identity, provider identity or service
+delivery. If a receipt already exists for the transaction, that receipt is
+returned (`existing: true`). Receipts are unlisted, not private. Anyone can view one at
 `https://onchaindiligence.com/r/<receipt_id>` and verify it there, or
 offline.
 
