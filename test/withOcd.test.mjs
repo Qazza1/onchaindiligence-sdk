@@ -48,7 +48,7 @@ function json(value, status = 200, headers = {}) {
   return new Response(JSON.stringify(value), { status, headers: { 'content-type': 'application/json', ...headers } })
 }
 
-function installOcdFetch({ decision = 'ALLOW', openFails = false, preflightFails = false, finalize = 'receipt', observeDelayMs = 0 } = {}) {
+function installOcdFetch({ decision = 'ALLOW', openFails = false, preflightFails = false, preflightPaymentRequired = false, finalize = 'receipt', observeDelayMs = 0 } = {}) {
   const original = globalThis.fetch
   const calls = []
   let operations = 0
@@ -63,6 +63,7 @@ function installOcdFetch({ decision = 'ALLOW', openFails = false, preflightFails
     }
     if (url.endsWith('/x402/lifecycle/preflight-payment')) {
       if (preflightFails) throw new Error('preflight transport failure')
+      if (preflightPaymentRequired && !new Headers(init.headers).has('payment-signature')) return json({ error: 'payment required' }, 402)
       return json({ decision: envelope(decision, `preflight-${operations}`).receipt.decision, checks: [], receipt: envelope(decision, `preflight-${operations}`), finalization: { capability: `cap-${operations}`, expires_at: '2030-01-01T00:00:00.000Z', endpoint: '/finalize' } })
     }
     if (url.includes('/execution-bindings') && init.method === 'POST') return json({ execution_request_id: `binding-${operations}` })
@@ -86,6 +87,49 @@ function installOcdFetch({ decision = 'ALLOW', openFails = false, preflightFails
 async function flush(delay = 15) { await new Promise((resolve) => setTimeout(resolve, delay)) }
 
 const policy = { acknowledge_unconstrained: true }
+
+test('withOcd: OCD paying transport handles the fee without routing merchant execution or recursing', async () => {
+  const fake = installOcdFetch({ preflightPaymentRequired: true })
+  try {
+    const transport = globalThis.fetch
+    const client = new HookClient(), received = [], paidUrls = []
+    const ocdFetch = async (url, init) => {
+      assert.equal(new URL(url).origin, 'https://mcp.onchaindiligence.com')
+      const first = await transport(url, init)
+      if (first.status !== 402) return first
+      paidUrls.push(String(url))
+      // The fee client can share hooks: OCD's own challenge must not open another operation.
+      const fee = requirement('fee')
+      assert.equal(await client.before[0](context(fee, 2, String(url))), undefined)
+      const headers = new Headers(init.headers); headers.set('payment-signature', 'synthetic-fee-proof')
+      return transport(url, { ...init, headers })
+    }
+    withOcd(client, { policy, ocdFetch, onReceipt: result => received.push(result) })
+    const selected = requirement('merchant')
+    assert.equal(await client.before[0](context(selected)), undefined)
+    await client.responses[0](response(selected, { success: true, transaction: TX }))
+    await flush()
+    assert.deepEqual(received.map(x => x.kind), ['full-lifecycle'])
+    assert.equal(fake.calls.filter(x => x.url.endsWith('/operations')).length, 1)
+    assert.equal(paidUrls.length, 1)
+    assert.ok(fake.calls.every(x => new URL(x.url).origin === 'https://mcp.onchaindiligence.com'))
+    assert.equal(JSON.parse(fake.calls.find(x => x.url.endsWith('/finalize')).body).transaction_hash, TX)
+  } finally { fake.restore() }
+})
+
+test('withOcd: unpaid 402 honestly aborts without execution or observation fallback', async () => {
+  const fake = installOcdFetch({ preflightPaymentRequired: true })
+  try {
+    const client = new HookClient(), received = []
+    withOcd(client, { policy, onOcdUnavailable: 'proceed', onReceipt: result => received.push(result) })
+    const selected = requirement('unpaid')
+    assert.equal((await client.before[0](context(selected))).abort, true)
+    await client.responses[0](response(selected, { success: true, transaction: TX }))
+    await flush()
+    assert.deepEqual(received.map(x => x.reason), ['preflight-not-ready'])
+    assert.ok(!fake.calls.some(x => /execution-bindings|observe-payment|finalize$/.test(x.url)))
+  } finally { fake.restore() }
+})
 
 test('withOcd: allowed x402 v2 exact payment reaches a full lifecycle receipt without mutating the client response', async () => {
   const fake = installOcdFetch()
