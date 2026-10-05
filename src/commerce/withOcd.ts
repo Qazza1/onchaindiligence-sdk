@@ -30,6 +30,8 @@ export interface WithOcdOptions {
   store?: CommerceRecoveryStore
   onOcdUnavailable?: 'abort' | 'proceed'
   baseUrl?: string
+  /** OCD-only transport, e.g. an x402-paying fetch for the preflight fee. Never used for merchant requests. */
+  ocdFetch?: typeof globalThis.fetch
 }
 
 export class OcdPaymentPolicyError extends Error {
@@ -231,7 +233,7 @@ export function withOcd(client: x402Client, options: WithOcdOptions): x402Client
   const baseUrl = (options.baseUrl ?? DEFAULT_BASE_URL).replace(/\/$/, '')
   const store = options.store ?? new InMemoryRecoveryStore()
   const unavailable = options.onOcdUnavailable ?? 'abort'
-  const ocd = createCommerceClient({ endpoint: baseUrl, recovery: store })
+  const ocd = createCommerceClient({ endpoint: baseUrl, recovery: store, fetch: options.ocdFetch })
   const flows = new WeakMap<object, Flow>()
 
   const emit = (flow: Flow, result: OcdResult): void => {

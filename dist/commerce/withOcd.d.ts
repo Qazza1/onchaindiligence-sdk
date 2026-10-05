@@ -31,6 +31,8 @@ export interface WithOcdOptions {
     store?: CommerceRecoveryStore;
     onOcdUnavailable?: 'abort' | 'proceed';
     baseUrl?: string;
+    /** OCD-only transport, e.g. an x402-paying fetch for the preflight fee. Never used for merchant requests. */
+    ocdFetch?: typeof globalThis.fetch;
 }
 export declare class OcdPaymentPolicyError extends Error {
     constructor(message: string);

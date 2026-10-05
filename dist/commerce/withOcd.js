@@ -168,7 +168,7 @@ export function withOcd(client, options) {
     const baseUrl = (options.baseUrl ?? DEFAULT_BASE_URL).replace(/\/$/, '');
     const store = options.store ?? new InMemoryRecoveryStore();
     const unavailable = options.onOcdUnavailable ?? 'abort';
-    const ocd = createCommerceClient({ endpoint: baseUrl, recovery: store });
+    const ocd = createCommerceClient({ endpoint: baseUrl, recovery: store, fetch: options.ocdFetch });
     const flows = new WeakMap();
     const emit = (flow, result) => {
         if (flow.terminalEmitted)

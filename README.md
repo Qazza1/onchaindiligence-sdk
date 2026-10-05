@@ -85,9 +85,16 @@ physical line of code.
 ```ts
 import { withOcd } from '@onchaindiligence/sdk/commerce'
 import { wrapFetchWithPayment } from '@x402/fetch'
+import { x402Client } from '@x402/core/client'
+import { ExactEvmScheme } from '@x402/evm/exact/client'
+
+// feePayer is your local dedicated low-balance Base USDC signer.
+const feeClient = new x402Client().register('eip155:8453', new ExactEvmScheme(feePayer))
 
 const client = withOcd(existingClient, {
   policy,
+  // x402-paying fetch configured with your dedicated OCD fee payer.
+  ocdFetch: wrapFetchWithPayment(globalThis.fetch.bind(globalThis), feeClient),
   onReceipt: (result) => {
     // Save or inspect a full-lifecycle, post-payment-evidence, blocked, or no-receipt result.
   },
@@ -114,6 +121,13 @@ asynchronous `onReceipt` result. While the process remains alive, the wrapper
 retries observation-pending finalization for the same operation; a crash or
 serverless restart still requires a durable store and caller-owned recovery.
 Each successful full lifecycle still incurs OCD's existing preflight fee.
+Supply `ocdFetch` with an x402-paying fetch for that fee (for example, a
+separate `x402Client` registered with `ExactEvmScheme` and your dedicated
+low-balance Base USDC fee signer). It is used only for requests to OCD;
+`fetchWithPay` above still uses `existingClient` for merchant payments. The
+fee signer stays local. Without `ocdFetch`, ordinary fetch remains the default
+and an unpaid 402 aborts preflight. OCD-origin payments bypass the wrapper's
+hooks to prevent recursive preflight.
 
 If OCD cannot be reached before an operation is opened, the default is to
 abort. `onOcdUnavailable: 'proceed'` is a deliberately narrow exception: once
