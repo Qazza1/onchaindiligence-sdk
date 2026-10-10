@@ -20,19 +20,8 @@ jobs:
         with:
           node-version: '24'
           cache: npm
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-        with:
-          repository: Qazza1/onchaindiligence
-          ref: 2e715a8c506ea45079d1b2fea76140706552cfc6
-          path: .d42-core
-          persist-credentials: false
+      # Same dependency artifacts a consumer installs from the public registry (lockfile-pinned).
       - run: npm ci --ignore-scripts --no-audit --no-fund
-        working-directory: .d42-core
-      - run: npm pack --workspace @onchaindiligence/agent-evidence --pack-destination "${RUNNER_TEMP}"
-        working-directory: .d42-core
-      - run: npm install --no-save --ignore-scripts --no-audit --no-fund "${RUNNER_TEMP}/onchaindiligence-agent-evidence-0.3.0.tgz"
       - run: npm run build
       - run: npx tsc -p tsconfig.examples.json
       - run: npm test
-        env:
-          OCD_AGENT_EVIDENCE_TARBALL: ${{ runner.temp }}/onchaindiligence-agent-evidence-0.3.0.tgz
