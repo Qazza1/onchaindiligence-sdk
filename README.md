@@ -84,17 +84,19 @@ physical line of code.
 
 ```ts
 import { withOcd } from '@onchaindiligence/sdk/commerce'
+import { NodeFileRecoveryStore } from '@onchaindiligence/sdk/commerce/node'
 import { wrapFetchWithPayment } from '@x402/fetch'
-import { x402Client } from '@x402/core/client'
-import { ExactEvmScheme } from '@x402/evm/exact/client'
 
-// feePayer is your local dedicated low-balance Base USDC signer.
-const feeClient = new x402Client().register('eip155:8453', new ExactEvmScheme(feePayer))
-
+// existingClient is the @x402/core v2 client you already use for merchant payments.
 const client = withOcd(existingClient, {
   policy,
-  // x402-paying fetch configured with your dedicated OCD fee payer.
-  ocdFetch: wrapFetchWithPayment(globalThis.fetch.bind(globalThis), feeClient),
+  // Attaches operations to YOUR private workspace Ledger. Without it they are anonymous.
+  accountApiKey: process.env.OCD_API_KEY,
+  // Durable recovery state. The default store is in-memory and is lost on restart.
+  store: new NodeFileRecoveryStore('./ocd-recovery'),
+  // OCD's preflight fee is an ordinary x402 payment. The client you already have can pay it;
+  // withOcd never preflights OCD's own origin, so there is no recursion and no second signer.
+  ocdFetch: wrapFetchWithPayment(globalThis.fetch.bind(globalThis), existingClient),
   onReceipt: (result) => {
     // Save or inspect a full-lifecycle, post-payment-evidence, blocked, or no-receipt result.
   },
@@ -104,6 +106,7 @@ const fetchWithPay = wrapFetchWithPayment(fetch, client)
 await fetchWithPay('https://merchant.example/paid')
 ```
 
+
 The existing wallet/signer stays entirely under the integrator's control;
 its private key is never sent to OCD. Before the x402 client creates a
 payment payload, the wrapper submits the exact selected x402 requirement to
@@ -112,22 +115,34 @@ payment creation. An OCD `ALLOW` remains a policy result, not wallet
 authorization.
 
 The wrapper supports **x402 v2 `exact`** requirements only. It is Node-first;
-browser use is not supported in v1. It uses `InMemoryRecoveryStore` by default
-for a normal process lifetime. For serverless or crash/restart recovery, pass a
-durable `CommerceRecoveryStore` and resume the saved operation with the
-commerce client; never store recovery credentials in browser storage. Receipt
-finalization may complete after the merchant HTTP response, so save the
-asynchronous `onReceipt` result. While the process remains alive, the wrapper
-retries observation-pending finalization for the same operation; a crash or
-serverless restart still requires a durable store and caller-owned recovery.
-Each successful full lifecycle still incurs OCD's existing preflight fee.
-Supply `ocdFetch` with an x402-paying fetch for that fee (for example, a
-separate `x402Client` registered with `ExactEvmScheme` and your dedicated
-low-balance Base USDC fee signer). It is used only for requests to OCD;
-`fetchWithPay` above still uses `existingClient` for merchant payments. The
-fee signer stays local. Without `ocdFetch`, ordinary fetch remains the default
-and an unpaid 402 aborts preflight. OCD-origin payments bypass the wrapper's
-hooks to prevent recursive preflight.
+browser use is not supported in v1. It uses `InMemoryRecoveryStore` by default,
+which is **not crash-safe**: it lives for one process only. For any restart,
+serverless or crash-recovery path pass a durable `CommerceRecoveryStore` such as
+`NodeFileRecoveryStore` (shown above), keep that directory private (it holds
+operation recovery credentials), and resume the saved operation with the commerce
+client (`client.load(operationId)`). Never store recovery credentials in browser
+storage. Receipt finalization may complete after the merchant HTTP response, so
+save the asynchronous `onReceipt` result. While the process stays alive the wrapper
+retries observation-pending finalization for the same operation; after a crash the
+durable store, not the wrapper, is what lets you continue it. `withOcd` has no
+stable purchase-attempt identity, so a crash between signing and the settlement
+response is not recovered automatically: use the Auto-Evidence package when you
+need that.
+
+**Workspace key.** `accountApiKey` is sent when an operation is created, and on one
+free ownership read (`GET /me/operations/:id`). If that read does not confirm the
+operation (invalid or revoked key), payment creation aborts *before* the paid
+preflight, so no fee is spent on evidence your Ledger would never show. The key does
+not authorize wallet spending and is never written to the recovery store.
+
+**Fees.** Each full lifecycle incurs OCD's preflight fee, an ordinary x402 payment of
+$0.01 USDC on Base, paid through `ocdFetch` and used only for requests to OCD
+(`fetchWithPay` still uses `existingClient` for merchant payments). Reusing your
+existing client is sufficient. A separate `x402Client` with a dedicated low-balance
+signer is optional hardening if you want OCD's fee isolated from merchant spend.
+Without `ocdFetch`, ordinary fetch remains the default and an unpaid 402 aborts
+preflight. OCD-origin payments bypass the wrapper's hooks to prevent recursive
+preflight.
 
 If OCD cannot be reached before an operation is opened, the default is to
 abort. `onOcdUnavailable: 'proceed'` is a deliberately narrow exception: once

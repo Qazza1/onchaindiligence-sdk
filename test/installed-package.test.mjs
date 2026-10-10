@@ -27,8 +27,9 @@ function runNpm(args, options = {}) {
 }
 
 test('packed SDK verifies a portable bundle in a clean zero-network consumer', async (t) => {
+  // Optional override for an unpublished @onchaindiligence/agent-evidence. When absent,
+  // npm resolves the SDK's declared range from the public registry (needs network).
   const coreTarball = process.env.OCD_AGENT_EVIDENCE_TARBALL
-  assert.ok(coreTarball, 'OCD_AGENT_EVIDENCE_TARBALL is required for the pre-release packed-install test')
 
   const dir = mkdtempSync(join(tmpdir(), 'ocd-sdk-installed-'))
   t.after(() => rmSync(dir, { recursive: true, force: true }))
@@ -37,14 +38,20 @@ test('packed SDK verifies a portable bundle in a clean zero-network consumer', a
   mkdirSync(artifacts)
   mkdirSync(consumer)
 
+  // A consumer needs its own package.json: without one npm installs into the nearest parent project.
+  writeFileSync(join(consumer, 'package.json'), JSON.stringify({ name: 'ocd-sdk-installed-consumer', private: true, type: 'module' }))
+
   const packed = await runNpm(['pack', '--json', '--pack-destination', artifacts], { cwd: root, env: process.env })
   assert.equal(packed.code, 0, `${packed.stderr}\n${packed.stdout}`)
   const sdkTarball = join(artifacts, JSON.parse(packed.stdout)[0].filename)
   const install = await runNpm(
-    ['install', '--ignore-scripts', '--no-audit', '--no-fund', '--package-lock=false', coreTarball, sdkTarball],
+    ['install', '--ignore-scripts', '--no-audit', '--no-fund', '--package-lock=false', ...(coreTarball ? [coreTarball] : []), sdkTarball],
     { cwd: consumer, env: process.env },
   )
   assert.equal(install.code, 0, install.stderr)
+  // The public SDK must actually distribute its stated MIT licence.
+  const licence = readFileSync(join(consumer, 'node_modules', '@onchaindiligence', 'sdk', 'LICENSE'), 'utf8')
+  assert.match(licence, /^MIT License/)
 
   const corpus = join(root, 'node_modules', '@onchaindiligence', 'agent-evidence', 'conformance')
   const bundle = JSON.parse(readFileSync(join(corpus, 'bundle-with-artifacts.json'), 'utf8'))

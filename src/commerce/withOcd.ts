@@ -29,6 +29,13 @@ export interface WithOcdOptions {
   /** Volatile by default. Supply durable storage for any restart/serverless recovery path. */
   store?: CommerceRecoveryStore
   onOcdUnavailable?: 'abort' | 'proceed'
+  /**
+   * Workspace API key (`ocd_...`). Without it operations are created anonymously and never appear in a
+   * private Ledger. When set, the key is sent on operation creation and on one free ownership read
+   * (`GET /me/operations/:id`); if ownership is not confirmed, payment creation aborts BEFORE the paid
+   * preflight. It never authorizes wallet spending and is never written to the recovery store.
+   */
+  accountApiKey?: string
   baseUrl?: string
   /** OCD-only transport, e.g. an x402-paying fetch for the preflight fee. Never used for merchant requests. */
   ocdFetch?: typeof globalThis.fetch
@@ -233,7 +240,8 @@ export function withOcd(client: x402Client, options: WithOcdOptions): x402Client
   const baseUrl = (options.baseUrl ?? DEFAULT_BASE_URL).replace(/\/$/, '')
   const store = options.store ?? new InMemoryRecoveryStore()
   const unavailable = options.onOcdUnavailable ?? 'abort'
-  const ocd = createCommerceClient({ endpoint: baseUrl, recovery: store, fetch: options.ocdFetch })
+  const accountApiKey = options.accountApiKey?.trim() || undefined
+  const ocd = createCommerceClient({ endpoint: baseUrl, recovery: store, fetch: options.ocdFetch, accountApiKey })
   const flows = new WeakMap<object, Flow>()
 
   const emit = (flow: Flow, result: OcdResult): void => {
@@ -274,6 +282,19 @@ export function withOcd(client: x402Client, options: WithOcdOptions): x402Client
       emit(flow, { kind: 'post-payment-evidence', receipt: (await res.json()) as ReceiptEnvelope })
     } catch {
       emit(flow, { kind: 'no-receipt', reason: unobserved })
+    }
+  }
+
+  /** Free read-only check that the new operation is visible to the configured workspace. */
+  const workspaceOwnership = async (operationId: string): Promise<'owned' | 'not-owned' | 'unreachable'> => {
+    try {
+      const res = await ocd.apiFetch(`/me/operations/${encodeURIComponent(operationId)}`, {
+        headers: { authorization: `Bearer ${accountApiKey}` },
+        redirect: 'error',
+      })
+      return res.ok ? 'owned' : 'not-owned'
+    } catch {
+      return 'unreachable'
     }
   }
 
@@ -353,6 +374,22 @@ export function withOcd(client: x402Client, options: WithOcdOptions): x402Client
         return
       }
       return { abort: true, reason: `OCD policy enforcement aborted payment creation: unable to open an OCD operation (${error instanceof Error ? error.message : 'unknown error'})` }
+    }
+
+    // A workspace key that is not honoured must not silently produce an
+    // anonymous operation: stop before the paid preflight, so no fee is spent
+    // on evidence the workspace Ledger would never show.
+    if (accountApiKey) {
+      const ownership = await workspaceOwnership(operation.operationId)
+      if (ownership === 'unreachable' && unavailable === 'proceed') {
+        flows.set(requirements, { kind: 'fallback', terminalEmitted: false })
+        return
+      }
+      if (ownership !== 'owned') {
+        const flow: FallbackFlow = { kind: 'fallback', terminalEmitted: false }
+        emit(flow, { kind: 'no-receipt', reason: 'workspace-ownership-not-confirmed', operationId: operation.operationId })
+        return { abort: true, reason: 'OCD policy enforcement aborted payment creation: the configured workspace API key did not confirm ownership of the new operation (invalid, revoked or unreachable); no preflight fee was spent' }
+      }
     }
 
     // From here forward, observation-only fallback is forbidden: an OCD

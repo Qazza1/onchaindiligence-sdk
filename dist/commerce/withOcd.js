@@ -168,7 +168,8 @@ export function withOcd(client, options) {
     const baseUrl = (options.baseUrl ?? DEFAULT_BASE_URL).replace(/\/$/, '');
     const store = options.store ?? new InMemoryRecoveryStore();
     const unavailable = options.onOcdUnavailable ?? 'abort';
-    const ocd = createCommerceClient({ endpoint: baseUrl, recovery: store, fetch: options.ocdFetch });
+    const accountApiKey = options.accountApiKey?.trim() || undefined;
+    const ocd = createCommerceClient({ endpoint: baseUrl, recovery: store, fetch: options.ocdFetch, accountApiKey });
     const flows = new WeakMap();
     const emit = (flow, result) => {
         if (flow.terminalEmitted)
@@ -209,6 +210,19 @@ export function withOcd(client, options) {
         }
         catch {
             emit(flow, { kind: 'no-receipt', reason: unobserved });
+        }
+    };
+    /** Free read-only check that the new operation is visible to the configured workspace. */
+    const workspaceOwnership = async (operationId) => {
+        try {
+            const res = await ocd.apiFetch(`/me/operations/${encodeURIComponent(operationId)}`, {
+                headers: { authorization: `Bearer ${accountApiKey}` },
+                redirect: 'error',
+            });
+            return res.ok ? 'owned' : 'not-owned';
+        }
+        catch {
+            return 'unreachable';
         }
     };
     const finalizationCapabilityExpired = async (operationId) => {
@@ -286,6 +300,21 @@ export function withOcd(client, options) {
                 return;
             }
             return { abort: true, reason: `OCD policy enforcement aborted payment creation: unable to open an OCD operation (${error instanceof Error ? error.message : 'unknown error'})` };
+        }
+        // A workspace key that is not honoured must not silently produce an
+        // anonymous operation: stop before the paid preflight, so no fee is spent
+        // on evidence the workspace Ledger would never show.
+        if (accountApiKey) {
+            const ownership = await workspaceOwnership(operation.operationId);
+            if (ownership === 'unreachable' && unavailable === 'proceed') {
+                flows.set(requirements, { kind: 'fallback', terminalEmitted: false });
+                return;
+            }
+            if (ownership !== 'owned') {
+                const flow = { kind: 'fallback', terminalEmitted: false };
+                emit(flow, { kind: 'no-receipt', reason: 'workspace-ownership-not-confirmed', operationId: operation.operationId });
+                return { abort: true, reason: 'OCD policy enforcement aborted payment creation: the configured workspace API key did not confirm ownership of the new operation (invalid, revoked or unreachable); no preflight fee was spent' };
+            }
         }
         // From here forward, observation-only fallback is forbidden: an OCD
         // preflight has been attempted or an operation state must be preserved.

@@ -30,6 +30,13 @@ export interface WithOcdOptions {
     /** Volatile by default. Supply durable storage for any restart/serverless recovery path. */
     store?: CommerceRecoveryStore;
     onOcdUnavailable?: 'abort' | 'proceed';
+    /**
+     * Workspace API key (`ocd_...`). Without it operations are created anonymously and never appear in a
+     * private Ledger. When set, the key is sent on operation creation and on one free ownership read
+     * (`GET /me/operations/:id`); if ownership is not confirmed, payment creation aborts BEFORE the paid
+     * preflight. It never authorizes wallet spending and is never written to the recovery store.
+     */
+    accountApiKey?: string;
     baseUrl?: string;
     /** OCD-only transport, e.g. an x402-paying fetch for the preflight fee. Never used for merchant requests. */
     ocdFetch?: typeof globalThis.fetch;
