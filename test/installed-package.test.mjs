@@ -49,6 +49,9 @@ test('packed SDK verifies a portable bundle in a clean zero-network consumer', a
     { cwd: consumer, env: process.env },
   )
   assert.equal(install.code, 0, install.stderr)
+  // The public SDK must actually distribute its stated MIT licence.
+  const licence = readFileSync(join(consumer, 'node_modules', '@onchaindiligence', 'sdk', 'LICENSE'), 'utf8')
+  assert.match(licence, /^MIT License/)
 
   const corpus = join(root, 'node_modules', '@onchaindiligence', 'agent-evidence', 'conformance')
   const bundle = JSON.parse(readFileSync(join(corpus, 'bundle-with-artifacts.json'), 'utf8'))
