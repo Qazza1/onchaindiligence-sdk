@@ -359,3 +359,26 @@ validity, and anchor status remain separate checks.
 ## License
 
 MIT
+# Authenticated free preflight (unreleased)
+
+This source adds explicit `preflightMode: 'free'` to `createCommerceClient`; published SDK 0.9.0 does not support it.
+It requires an existing workspace API key and a server with the enabled authenticated free route.
+
+```js
+const client = createCommerceClient({
+  accountApiKey: process.env.OCD_ACCOUNT_API_KEY,
+  preflightMode: 'free',
+  recovery, // persistent CommerceRecoveryStore; keep it across retries/restarts
+})
+const operation = await client.open({ action, policy })
+const evaluation = await operation.preflight()
+// Execute through your existing merchant wallet/provider ONLY if evaluation.kind === 'ready'.
+```
+
+Free mode uses ordinary fetch and `POST /operations/{id}/preflight/free`, with the workspace key and original recovery
+credential. No OCD fee signer or payment-aware fetch is needed. Merchant payments still require your own signer/funds.
+Allowance exhaustion returns `kind: 'terminal-error'`, `error: 'free_allowance_exhausted'`, `resetAt`, `paidFallback: false`.
+Disabled service, older servers, auth failures and exhausted allowance never switch to the paid route. Transient failures
+return pending; retry the SAME operation and input, not a replacement purchase. The local recovery record pins the mode.
+Paid mode remains the default. This is not a production rollout or an unlimited entitlement; allowance and activation
+are server-controlled. Receipt verification/settlement semantics are unchanged.

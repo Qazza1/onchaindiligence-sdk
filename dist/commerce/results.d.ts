@@ -43,6 +43,8 @@ export type PreflightEvaluation = {
     kind: 'terminal-error';
     operationId: string;
     error: string;
+    resetAt?: string;
+    paidFallback?: false;
 };
 export type ExecutionRecord = {
     kind: 'execution-recorded';
