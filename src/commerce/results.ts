@@ -34,7 +34,7 @@ export type PreflightEvaluation =
   | { kind: 'blocked'; operationId: string; receipt: ReceiptEnvelope; reasons: string[] }
   | { kind: 'approval-required'; operationId: string; receipt: ReceiptEnvelope; reasons: string[] }
   | ({ kind: 'pending' } & PendingInfo)
-  | { kind: 'terminal-error'; operationId: string; error: string }
+  | { kind: 'terminal-error'; operationId: string; error: string; resetAt?: string; paidFallback?: false }
 
 export type ExecutionRecord =
   | { kind: 'execution-recorded'; operationId: string; executionRequestId: string; transactionHash: string; providerReference?: string | null }

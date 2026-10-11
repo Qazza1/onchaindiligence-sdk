@@ -67,11 +67,13 @@ export interface CreateCommerceClientOptions {
     /**
      * Optional OCD workspace API key (dashboard -> Settings -> API keys). When set, NEW operations
      * created by open() are attached to your private OCD workspace so they appear in your dashboard.
-     * Sent only as `Authorization: Bearer` on POST /operations -- never on receipt lookups, verification,
-     * or any later lifecycle call, and never stored in recovery records. It does NOT authorize wallet
+     * Sent as `Authorization: Bearer` on POST /operations and, only in explicit free mode,
+     * operation-bound free preflight -- never on receipt lookups/verification or in recovery records. It does NOT authorize wallet
      * spending and is unrelated to recovery credentials or agent identity.
      */
     accountApiKey?: string;
+    /** Explicit opt-in to the authenticated allowance route. Never falls back to paid preflight. */
+    preflightMode?: 'paid' | 'free';
     fetch?: typeof globalThis.fetch;
 }
 export interface OpenParams {
@@ -84,6 +86,8 @@ export interface OpenParams {
     publication?: CommercePublication;
 }
 export declare class OnchainDiligenceCommerceClient {
+    /** Runtime feature/mode check for integrations; older SDKs do not expose this field. */
+    readonly preflightMode: 'paid' | 'free';
     private readonly endpoint;
     private readonly recovery;
     private readonly fetchImpl;
@@ -96,6 +100,8 @@ export declare class OnchainDiligenceCommerceClient {
     readError(res: Response): Promise<string>;
     /** @internal */
     recoveryStore(): CommerceRecoveryStore;
+    /** @internal -- never written to recovery or result objects. */
+    freePreflightHeaders(): Record<string, string>;
     /** @internal */
     trustOptions(): {
         verifyReceipts?: boolean;

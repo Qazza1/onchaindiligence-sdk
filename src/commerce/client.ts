@@ -89,11 +89,13 @@ export interface CreateCommerceClientOptions {
   /**
    * Optional OCD workspace API key (dashboard -> Settings -> API keys). When set, NEW operations
    * created by open() are attached to your private OCD workspace so they appear in your dashboard.
-   * Sent only as `Authorization: Bearer` on POST /operations -- never on receipt lookups, verification,
-   * or any later lifecycle call, and never stored in recovery records. It does NOT authorize wallet
+   * Sent as `Authorization: Bearer` on POST /operations and, only in explicit free mode,
+   * operation-bound free preflight -- never on receipt lookups/verification or in recovery records. It does NOT authorize wallet
    * spending and is unrelated to recovery credentials or agent identity.
    */
   accountApiKey?: string
+  /** Explicit opt-in to the authenticated allowance route. Never falls back to paid preflight. */
+  preflightMode?: 'paid' | 'free'
   fetch?: typeof globalThis.fetch
 }
 
@@ -133,6 +135,8 @@ function toRecoveryCapabilityClass(mode: ExecutorRecoveryMode): 'provider-idempo
 }
 
 export class OnchainDiligenceCommerceClient {
+  /** Runtime feature/mode check for integrations; older SDKs do not expose this field. */
+  readonly preflightMode: 'paid' | 'free'
   private readonly endpoint: string
   private readonly recovery: CommerceRecoveryStore
   private readonly fetchImpl: typeof globalThis.fetch
@@ -152,6 +156,9 @@ export class OnchainDiligenceCommerceClient {
     this.fetchImpl = options.fetch ?? globalThis.fetch.bind(globalThis)
     this.trust = options.trust ?? {}
     this.accountApiKey = options.accountApiKey?.trim() || undefined
+    this.preflightMode = options.preflightMode ?? 'paid'
+    if (this.preflightMode !== 'paid' && this.preflightMode !== 'free') throw new Error('invalid preflightMode')
+    if (this.preflightMode === 'free' && !this.accountApiKey) throw new Error('free preflight requires a workspace API key')
   }
 
   /** @internal */
@@ -174,6 +181,11 @@ export class OnchainDiligenceCommerceClient {
     return this.recovery
   }
 
+  /** @internal -- never written to recovery or result objects. */
+  freePreflightHeaders(): Record<string, string> {
+    return this.preflightMode === 'free' ? { authorization: `Bearer ${this.accountApiKey}` } : {}
+  }
+
   /** @internal */
   trustOptions(): { verifyReceipts?: boolean } {
     return this.trust
@@ -192,7 +204,7 @@ export class OnchainDiligenceCommerceClient {
     }
 
     // `client_source: 'sdk'` is client-declared transport metadata (not agent identity). The workspace
-    // key, if configured, is attached to this one request only.
+    // key, if configured, attaches ownership here (and authenticates explicit free preflight).
     const res = await this.apiFetch('/operations', {
       method: 'POST',
       headers: { 'content-type': 'application/json', ...(this.accountApiKey ? { authorization: `Bearer ${this.accountApiKey}` } : {}) },
@@ -207,6 +219,7 @@ export class OnchainDiligenceCommerceClient {
     const record = await this.recovery.create({
       operationId: created.operation_id,
       recoveryCredential: created.recovery_credential,
+      ...(this.preflightMode === 'free' ? { preflightMode: 'free' as const } : {}),
       preflightReceiptId: null,
       preflightDecisionStatus: null,
       finalizationCapability: null,
@@ -237,6 +250,7 @@ export class OnchainDiligenceCommerceClient {
       await this.recovery.create({
         operationId,
         recoveryCredential,
+        ...(this.preflightMode === 'free' ? { preflightMode: 'free' as const } : {}),
         preflightReceiptId: status.preflight_receipt_id,
         // Not known from OperationStatus alone -- execute() re-fetches the
         // authoritative receipt when this is null (see assertPreflightAllowed()).
@@ -444,6 +458,11 @@ export class CommerceOperation {
   // --- preflight -----------------------------------------------------------
 
   async preflight(): Promise<PreflightEvaluation> {
+    const free = this.client.preflightMode === 'free'
+    // Historical records are paid. A restart must not change the fee mode of an existing attempt.
+    if ((this.record.preflightMode ?? 'paid') !== this.client.preflightMode) {
+      return { kind: 'terminal-error', operationId: this.operationId, error: 'preflight_mode_conflict' }
+    }
     if (!this.pendingPreflightInput) {
       // Resumed from a restart with no in-memory action/policy -- if the
       // preflight step already completed server-side, its receipt id is on
@@ -466,12 +485,13 @@ export class CommerceOperation {
     const body = JSON.stringify({ action, policy, options: {}, references: {}, publication: publication ?? {} })
     let res: Response
     try {
-      res = await this.client.apiFetch('/x402/lifecycle/preflight-payment', {
+      res = await this.client.apiFetch(free ? `/operations/${encodeURIComponent(this.operationId)}/preflight/free` : '/x402/lifecycle/preflight-payment', {
         method: 'POST',
         headers: {
           'content-type': 'application/json',
           [OPERATION_HEADER]: this.operationId,
           [RECOVERY_HEADER]: this.record.recoveryCredential,
+          ...this.client.freePreflightHeaders(),
         },
         body,
       })
@@ -481,18 +501,25 @@ export class CommerceOperation {
       // next action is genuinely "retry", not just "wait".
       return pending(this.operationId, {
         phase: 'preflight-in-progress',
-        safeNextAction: 'retry op.preflight() with the identical action/policy -- the server deduplicates by operation and input, so this cannot pay twice',
-        mayAlreadyHavePaid: true,
+        safeNextAction: free ? 'retry the same free preflight with identical action/policy; do not start a replacement operation or purchase' : 'retry op.preflight() with the identical action/policy -- the server deduplicates by operation and input, so this cannot pay twice',
+        mayAlreadyHavePaid: !free,
       })
     }
 
+    if (free && !res.ok) {
+      const error = await res.clone().json().catch(() => ({})) as { error?: string; reset_at?: string }
+      if (error.error === 'free_preflight_disabled' || res.status === 429) {
+        return { kind: 'terminal-error', operationId: this.operationId, error: error.error ?? `HTTP ${res.status}`,
+          paidFallback: false, ...(typeof error.reset_at === 'string' ? { resetAt: error.reset_at } : {}) }
+      }
+    }
     if (res.status === 425 || res.status === 503) {
       const retryAfter = Number(res.headers.get('retry-after')) || undefined
       return pending(this.operationId, {
         phase: 'preflight-in-progress',
         safeNextAction: 'retry op.preflight() shortly -- do not attempt payment through any other path',
         retryAfterSeconds: retryAfter,
-        mayAlreadyHavePaid: true,
+        mayAlreadyHavePaid: !free,
       })
     }
     if (!res.ok) {

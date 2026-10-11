@@ -25,6 +25,8 @@ export interface CommerceRecoveryRecord {
   operationId: string
   /** The OCD-issued recovery credential — required to call GET /operations/:id, POST .../execution-bindings, POST .../finalize. Never log this. */
   recoveryCredential: string
+  /** Optional for historical paid records; persisted before free preflight to prevent mode changes on restart. */
+  preflightMode?: 'paid' | 'free'
   /** Optimistic-concurrency version. Starts at 1; every update() must supply the version it read and gets back the new one. */
   version: number
   createdAt: string
