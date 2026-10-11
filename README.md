@@ -65,7 +65,7 @@ const client = createCommerceClient({
 const operation = await client.open({ action, policy })
 ```
 
-The key is sent only when a new operation is created. It does **not** authorize wallet spending, is
+In default paid mode, the key is sent only when a new operation is created. With explicit free mode, it also authenticates the operation-bound free preflight request. It does **not** authorize wallet spending, is
 separate from recovery credentials (never written to the recovery store), and is not agent identity.
 The SDK also declares itself as the operation's client (`OCD SDK` in the dashboard); that is client
 metadata, separate from signed agent identity/provenance.
@@ -359,9 +359,9 @@ validity, and anchor status remain separate checks.
 ## License
 
 MIT
-# Authenticated free preflight (unreleased)
+# Authenticated free preflight (SDK 0.10.0; backend activation required)
 
-This source adds explicit `preflightMode: 'free'` to `createCommerceClient`; published SDK 0.9.0 does not support it.
+SDK 0.10.0 adds explicit `preflightMode: 'free'` to `createCommerceClient`. The existing published SDK 0.9.0 does not support this mode; the feature becomes usable only after the server's authenticated free route is enabled.
 It requires an existing workspace API key and a server with the enabled authenticated free route.
 
 ```js
@@ -380,5 +380,5 @@ credential. No OCD fee signer or payment-aware fetch is needed. Merchant payment
 Allowance exhaustion returns `kind: 'terminal-error'`, `error: 'free_allowance_exhausted'`, `resetAt`, `paidFallback: false`.
 Disabled service, older servers, auth failures and exhausted allowance never switch to the paid route. Transient failures
 return pending; retry the SAME operation and input, not a replacement purchase. The local recovery record pins the mode.
-Paid mode remains the default. This is not a production rollout or an unlimited entitlement; allowance and activation
+Paid mode remains the default. Publishing SDK 0.10.0 is not a production rollout or an unlimited entitlement; allowance and activation
 are server-controlled. Receipt verification/settlement semantics are unchanged.
