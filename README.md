@@ -382,4 +382,3 @@ Disabled service, older servers, auth failures and exhausted allowance never swi
 return pending; retry the SAME operation and input, not a replacement purchase. The local recovery record pins the mode.
 Paid mode remains the default. This is not a production rollout or an unlimited entitlement; allowance and activation
 are server-controlled. Receipt verification/settlement semantics are unchanged.
-
