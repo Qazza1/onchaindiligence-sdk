@@ -105,6 +105,11 @@ export function createFakeServer(options = {}) {
         return json({ error: 'in progress' }, 425, { 'retry-after': '2' })
       }
 
+      if (options.simulatePaymentInFlightOnce && !options._paymentInFlightUsed) {
+        options._paymentInFlightUsed = true
+        return json({ error: 'a paid attempt is in flight', reason: 'payment_in_flight', may_already_have_paid: true, retry_after_seconds: 7 }, 409, { 'retry-after': '7' })
+      }
+
       if (options.simulateAmbiguousPreflightOnce && !options._ambiguousPreflightUsed) {
         options._ambiguousPreflightUsed = true
         preflightSteps.set(operationId, { inputDigest, status: 'claimed' })

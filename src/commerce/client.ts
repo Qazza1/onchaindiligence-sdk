@@ -496,12 +496,15 @@ export class CommerceOperation {
         body,
       })
     } catch {
-      // No response at all -- per D2.4, retrying this EXACT call is safe
-      // (same operation + same input digest never pays twice), so the safe
-      // next action is genuinely "retry", not just "wait".
+      // No response at all. Retrying this EXACT call over the SAME operation
+      // is the safe path: the server keeps one paid attempt per operation
+      // step, refuses a concurrent second one (409 payment_in_flight), and
+      // reconciles an uncertain earlier attempt on-chain before accepting a
+      // new payment. That is effective idempotency for the OCD fee, not an
+      // absolute exactly-once guarantee -- never retry through another path.
       return pending(this.operationId, {
         phase: 'preflight-in-progress',
-        safeNextAction: free ? 'retry the same free preflight with identical action/policy; do not start a replacement operation or purchase' : 'retry op.preflight() with the identical action/policy -- the server deduplicates by operation and input, so this cannot pay twice',
+        safeNextAction: free ? 'retry the same free preflight with identical action/policy; do not start a replacement operation or purchase' : 'retry op.preflight() with the identical action/policy on this same operation -- the server holds one paid attempt per operation and reconciles an uncertain one before accepting another; never pay through any other path',
         mayAlreadyHavePaid: !free,
       })
     }
@@ -511,6 +514,20 @@ export class CommerceOperation {
       if (error.error === 'free_preflight_disabled' || res.status === 429) {
         return { kind: 'terminal-error', operationId: this.operationId, error: error.error ?? `HTTP ${res.status}`,
           paidFallback: false, ...(typeof error.reset_at === 'string' ? { resetAt: error.reset_at } : {}) }
+      }
+    }
+    if (!free && res.status === 409) {
+      // F4: a paid attempt for this operation is in flight, or an earlier
+      // attempt's outcome is still being reconciled. Nothing was charged by
+      // THIS request; the earlier one may have been.
+      const state = await res.clone().json().catch(() => ({})) as { reason?: string; retry_after_seconds?: number }
+      if (state.reason === 'payment_in_flight' || state.reason === 'payment_outcome_uncertain') {
+        return pending(this.operationId, {
+          phase: 'preflight-in-progress',
+          safeNextAction: 'wait for Retry-After, then retry op.preflight() with the identical action/policy on this same operation -- do not create a new operation or pay through any other path',
+          retryAfterSeconds: Number(res.headers.get('retry-after')) || state.retry_after_seconds || undefined,
+          mayAlreadyHavePaid: true,
+        })
       }
     }
     if (res.status === 425 || res.status === 503) {
