@@ -285,3 +285,17 @@ test('pending observation returns machine-readable safe next action', async () =
   const second = await op.observeAndFinalize()
   assert.equal(second.kind, 'receipt-produced')
 })
+
+test('F4: a server-reported in-flight paid attempt is pending (may already have paid), never a terminal error', async () => {
+  const server = createFakeServer({ simulatePaymentInFlightOnce: true })
+  const client = createCommerceClient({ recovery: new InMemoryRecoveryStore(), fetch: server.fetch })
+  const op = await client.open({ action: ACTION, policy: POLICY })
+  const first = await op.preflight()
+  assert.equal(first.kind, 'pending')
+  assert.equal(first.phase, 'preflight-in-progress')
+  assert.equal(first.mayAlreadyHavePaid, true)
+  assert.equal(first.retryAfterSeconds, 7)
+  assert.doesNotMatch(first.safeNextAction, /cannot pay twice/)
+  const second = await op.preflight()
+  assert.equal(second.kind, 'ready', 'the same operation completes on retry')
+})
