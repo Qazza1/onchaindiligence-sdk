@@ -20,7 +20,7 @@ Two things live in this package:
    below.
 
 ```bash
-npm install @onchaindiligence/sdk
+npm install @onchaindiligence/sdk@0.10.1
 ```
 
 ## Agent payment lifecycle (Commerce client)
@@ -38,13 +38,17 @@ never replaces your executor's own authorization — see
 import { createCommerceClient, MockCommerceExecutor, apiPurchasePolicy, BASE_USDC } from '@onchaindiligence/sdk/commerce'
 import { NodeFileRecoveryStore } from '@onchaindiligence/sdk/commerce/node' // Node-only; browser code implements CommerceRecoveryStore itself
 
-const ocd = createCommerceClient({ recovery: new NodeFileRecoveryStore('./ocd-recovery') })
+const ocd = createCommerceClient({
+  accountApiKey: process.env.OCD_ACCOUNT_API_KEY,
+  preflightMode: 'free', // recommended for NEW workspace-owned operations
+  recovery: new NodeFileRecoveryStore('./ocd-recovery'),
+})
 
 const { policy } = apiPurchasePolicy({ maxAmount: '1.00', allowedNetwork: 'eip155:8453', allowedAsset: BASE_USDC })
 const op = await ocd.open({ action: proposedPayment, policy })
 
 const evaluation = await op.preflight()
-if (evaluation.kind === 'blocked' || evaluation.kind === 'approval-required') return handleThat(evaluation)
+if (evaluation.kind !== 'ready') return handleThat(evaluation) // includes pending, exhausted and unavailable
 
 const execution = await op.execute({ executor: myExecutor }) // e.g. new X402BaseUsdcExecutor({ signer: toClientEvmSigner(account) })
 if (execution.kind !== 'execution-recorded') return handleThat(execution)
@@ -59,6 +63,7 @@ workspace API key:
 ```ts
 const client = createCommerceClient({
   accountApiKey: process.env.OCD_API_KEY,
+  preflightMode: 'free',
   recovery
 })
 
@@ -75,6 +80,12 @@ runnable, ~20-line integration (uses a mocked executor and an in-process demo
 server — `npx tsx examples/quickstart.ts` costs nothing and needs no wallet).
 
 ### Existing x402 client: thin OCD wrapper
+
+**Legacy paid integration, not the free onboarding path.** SDK 0.10.1 `withOcd` has no
+`preflightMode` option. Supplying a paying `ocdFetch` authorizes the 0.01 USDC Base
+preflight fee, including BLOCK evaluations. For new free integrations use
+`createCommerceClient({ preflightMode: 'free', ... })` or the published Auto-Evidence
+proxy with explicit free mode. A workspace API key alone does not select free mode.
 
 If you already use an `@x402/core` v2 client and
 `wrapFetchWithPayment`, `withOcd` adds the existing OCD preflight,
@@ -359,10 +370,12 @@ validity, and anchor status remain separate checks.
 ## License
 
 MIT
-# Authenticated free preflight (SDK 0.10.0; backend activation required)
+# Authenticated free preflight (recommended; SDK 0.10.1)
 
-SDK 0.10.0 adds explicit `preflightMode: 'free'` to `createCommerceClient`. The existing published SDK 0.9.0 does not support this mode; the feature becomes usable only after the server's authenticated free route is enabled.
-It requires an existing workspace API key and a server with the enabled authenticated free route.
+SDK 0.10.1 supports explicit `preflightMode: 'free'` in `createCommerceClient`.
+Sign in at https://app.onchaindiligence.com and obtain an existing workspace API key.
+Production allows 100 completed evaluations per workspace per UTC month; ALLOW and
+BLOCK both count. No OCD fee signer or funded fee wallet is required.
 
 ```js
 const client = createCommerceClient({
@@ -380,5 +393,14 @@ credential. No OCD fee signer or payment-aware fetch is needed. Merchant payment
 Allowance exhaustion returns `kind: 'terminal-error'`, `error: 'free_allowance_exhausted'`, `resetAt`, `paidFallback: false`.
 Disabled service, older servers, auth failures and exhausted allowance never switch to the paid route. Transient failures
 return pending; retry the SAME operation and input, not a replacement purchase. The local recovery record pins the mode.
-Paid mode remains the default. Publishing SDK 0.10.0 is not a production rollout or an unlimited entitlement; allowance and activation
-are server-controlled. Receipt verification/settlement semantics are unchanged.
+The low-level API retains paid mode when omitted for backwards compatibility; always
+select free mode explicitly for new onboarding. Historical recovery records without a
+mode are paid. Resume them with the original paid configuration, same operation and
+recovery store; never switch modes or create a replacement to escape an uncertain fee.
+Free exhaustion never authorizes a paid retry. Inspect allowance at
+https://app.onchaindiligence.com/#usage. Receipt VALID means integrity/authenticity,
+not settlement, authorization or fulfilment. Merchant payment/gas costs are separate.
+
+Pricing roadmap (not active billing): Developer Free $0 / 100 evaluations per month;
+Pay As You Go planned, price not finalized; Business planned at $499/month;
+Enterprise custom. Neither paid plan is available to purchase through this SDK.

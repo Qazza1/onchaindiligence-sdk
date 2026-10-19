@@ -8,7 +8,9 @@
  * MockCommerceExecutor for X402BaseUsdcExecutor with a real funded signer
  * (`toClientEvmSigner(privateKeyToAccount(pk))` for Node, or a hand-built
  * ClientEvmSigner around an injected wallet's `signTypedData` in a browser)
- * — nothing else in this file changes.
+ * This fixture is NOT a production payment configuration. For new production
+ * onboarding use explicit preflightMode: 'free', a workspace API key and durable
+ * recovery; merchant execution still requires a separate, explicit integration.
  *
  * This is the ~20-line integration the SDK exists to make possible:
  *
@@ -35,10 +37,9 @@ async function main() {
   //    `fetch: createDemoFetch()` points this quickstart at an in-process
   //    demo server (examples/demoServer.ts) so the WHOLE lifecycle below
   //    completes for free, deterministically, with no live network call.
-  //    For a real integration: delete the `fetch` line entirely (the
-  //    client then talks to the real https://mcp.onchaindiligence.com),
-  //    and swap MockCommerceExecutor below for X402BaseUsdcExecutor with a
-  //    real funded viem Account -- preflight becomes a real $0.01 payment.
+  //    Do not turn this fixture into production by just deleting fetch.
+  //    Follow README's explicit free-mode setup with a workspace API key and
+  //    persistent recovery. Omitted preflightMode remains legacy paid mode.
   const ocd = createCommerceClient({
     recovery: new InMemoryRecoveryStore(),
     fetch: createDemoFetch(),
